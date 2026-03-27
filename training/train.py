@@ -40,7 +40,7 @@ class ModelConfig:
 
     @staticmethod
     def micro():
-        return ModelConfig(dim=288, hidden_dim=768, n_layers=6, n_heads=6, n_kv_heads=2, vocab_size=32000, max_seq_len=256)
+        return ModelConfig(dim=288, hidden_dim=768, n_layers=6, n_heads=6, n_kv_heads=2, vocab_size=16000, max_seq_len=256)
 
     @staticmethod
     def tiny():
@@ -522,6 +522,12 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
           epochs: int = 10, batch_size: int = 4, lr: float = 3e-4, device: str = "cuda",
           output_path: str = "models/lai.bin"):
     """Train the model"""
+    # CPU Optimization for Xeon
+    if device == "cpu":
+        num_threads = psutil.cpu_count(logical=False)
+        torch.set_num_threads(num_threads)
+        print(f"  CPU Training: Using {num_threads} threads")
+
     checkpoint_dir = Path("checkpoints")
     checkpoint_dir.mkdir(exist_ok=True)
 
@@ -546,8 +552,12 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     # Dataset and dataloader
     dataset = TextDataset(train_texts, tokenizer, config.max_seq_len)
 
-    # MPS doesn't support multiprocessing in DataLoader well
-    num_workers = 0 if device == 'mps' else 2
+    # Use more workers for Xeon CPU
+    if device == "cpu":
+        num_workers = min(psutil.cpu_count(logical=False), 8)
+    else:
+        num_workers = 0 if device == 'mps' else 2
+        
     pin_memory = device == 'cuda'
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,

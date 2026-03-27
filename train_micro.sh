@@ -32,7 +32,7 @@ python3 training/train.py \
     --vocab data/vocab_micro.bin \
     --output models/lai-micro.bin \
     --epochs 10 \
-    --batch_size 16 \
+    --batch_size 128 \
     --device $DEVICE
 
 echo "--- Training Complete! ---"
