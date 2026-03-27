@@ -1,8 +1,9 @@
 # LAi - Lightweight AI Assistant
-# Pure C++ LLM for CPU-only inference
+# Pure C++ LLM inference with optional Metal GPU acceleration
 
 CXX := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic
+LDFLAGS :=
 
 # Detect platform and architecture
 UNAME_S := $(shell uname -s)
@@ -10,7 +11,9 @@ UNAME_M := $(shell uname -m)
 
 # Platform-specific flags
 ifeq ($(UNAME_S),Darwin)
-    # macOS
+    # macOS - enable Metal GPU backend
+    CXXFLAGS += -DLAI_METAL=1
+    LDFLAGS += -framework Metal -framework Foundation
     ifeq ($(UNAME_M),arm64)
         # Apple Silicon - NEON is implicit
         ARCH_FLAGS := -mcpu=apple-m1
@@ -46,11 +49,19 @@ SRCS := $(wildcard $(SRC_DIR)/*.cpp) \
         $(wildcard $(SRC_DIR)/model/*.cpp) \
         $(wildcard $(SRC_DIR)/tokenizer/*.cpp) \
         $(wildcard $(SRC_DIR)/inference/*.cpp) \
-        $(wildcard $(SRC_DIR)/cli/*.cpp)
+        $(wildcard $(SRC_DIR)/cli/*.cpp) \
+        $(wildcard $(SRC_DIR)/backend/*.cpp)
 
 # Object files
 OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(SRCS))
 DEBUG_OBJS := $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/debug/%.o,$(SRCS))
+
+# Metal sources (macOS only)
+ifeq ($(UNAME_S),Darwin)
+    METAL_SRCS := $(wildcard $(SRC_DIR)/backend/*.mm)
+    METAL_OBJS := $(patsubst $(SRC_DIR)/%.mm,$(OBJ_DIR)/%.o,$(METAL_SRCS))
+    METAL_DEBUG_OBJS := $(patsubst $(SRC_DIR)/%.mm,$(OBJ_DIR)/debug/%.o,$(METAL_SRCS))
+endif
 
 # Headers
 HDRS := $(wildcard $(SRC_DIR)/*.h) \
@@ -58,7 +69,8 @@ HDRS := $(wildcard $(SRC_DIR)/*.h) \
         $(wildcard $(SRC_DIR)/model/*.h) \
         $(wildcard $(SRC_DIR)/tokenizer/*.h) \
         $(wildcard $(SRC_DIR)/inference/*.h) \
-        $(wildcard $(SRC_DIR)/cli/*.h)
+        $(wildcard $(SRC_DIR)/cli/*.h) \
+        $(wildcard $(SRC_DIR)/backend/*.h)
 
 # Target
 TARGET := lai
@@ -75,11 +87,16 @@ all: release
 release: CXXFLAGS += $(RELEASE_FLAGS)
 release: $(TARGET)
 
-$(TARGET): $(OBJS)
+$(TARGET): $(OBJS) $(METAL_OBJS)
 	@echo "Linking $(TARGET)..."
-	$(CXX) $(CXXFLAGS) $(OBJS) -o $@ -lpthread
+	$(CXX) $(CXXFLAGS) $(OBJS) $(METAL_OBJS) -o $@ -lpthread $(LDFLAGS)
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+# Objective-C++ compilation (Metal backend)
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.mm $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
@@ -87,11 +104,15 @@ $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp $(HDRS)
 debug: CXXFLAGS += $(DEBUG_FLAGS)
 debug: $(DEBUG_TARGET)
 
-$(DEBUG_TARGET): $(DEBUG_OBJS)
+$(DEBUG_TARGET): $(DEBUG_OBJS) $(METAL_DEBUG_OBJS)
 	@echo "Linking $(DEBUG_TARGET)..."
-	$(CXX) $(CXXFLAGS) $(DEBUG_OBJS) -o $@ -lpthread
+	$(CXX) $(CXXFLAGS) $(DEBUG_OBJS) $(METAL_DEBUG_OBJS) -o $@ -lpthread $(LDFLAGS)
 
 $(OBJ_DIR)/debug/%.o: $(SRC_DIR)/%.cpp $(HDRS)
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+$(OBJ_DIR)/debug/%.o: $(SRC_DIR)/%.mm $(HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 

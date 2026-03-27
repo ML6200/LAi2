@@ -49,10 +49,11 @@ public:
     REPL() : mode_(Mode::CHAT), running_(false), verbose_(false) {}
 
     // Initialize with model (vocab is embedded in model)
-    bool init(const std::string& model_path, const std::string& vocab_path = "") {
+    bool init(const std::string& model_path, const std::string& vocab_path = "",
+              bool use_mmap = true, const std::string& backend_name = "auto") {
         std::cout << color::CYAN << "Loading model..." << color::RESET << std::endl;
 
-        if (!engine_.init(model_path, vocab_path)) {
+        if (!engine_.init(model_path, vocab_path, use_mmap, backend_name)) {
             std::cout << color::RED << "Failed to load model!" << color::RESET << std::endl;
             return false;
         }
@@ -116,6 +117,7 @@ private:
                   << cfg.n_heads << " heads\n";
         std::cout << "Memory: " << (engine_.memory_bytes() / (1024 * 1024)) << " MB\n";
         std::cout << "Vocab: " << engine_.tokenizer().vocab_size() << " tokens\n";
+        std::cout << "Backend: " << engine_.backend_name() << "\n";
         std::cout << color::RESET;
     }
 
@@ -135,6 +137,14 @@ private:
         std::cout << "  /en <text> - Translate Hungarian to English\n";
         std::cout << "  /temp <n>  - Set temperature (0.0-2.0)\n";
         std::cout << "  /tokens <n>- Set max tokens\n";
+        std::cout << "  /top_k <n> - Set top-k sampling (0 = disabled)\n";
+        std::cout << "  /top_p <n> - Set top-p/nucleus (0.0-1.0)\n";
+        std::cout << "  /min_p <n> - Set min-p threshold (0.0-1.0, 0 = disabled)\n";
+        std::cout << "  /repeat <n>- Set repetition penalty (1.0 = disabled)\n";
+        std::cout << "  /dry <n>   - Set DRY multiplier (0 = disabled)\n";
+        std::cout << "  /mirostat <tau> - Enable Mirostat v2 (0 = disabled)\n";
+        std::cout << "  /freq <n>  - Set frequency penalty (0 = disabled)\n";
+        std::cout << "  /pres <n>  - Set presence penalty (0 = disabled)\n";
         std::cout << "  /reset     - Reset conversation context\n";
         std::cout << "  /stats     - Toggle statistics display\n";
         std::cout << "  /info      - Show model information\n";
@@ -204,6 +214,78 @@ private:
                 std::cout << "Max tokens set to " << tokens << "\n";
             } else {
                 std::cout << "Usage: /tokens <1-2048>\n";
+            }
+        }
+        else if (command == "/top_k") {
+            i32 k;
+            if (iss >> k && k >= 0) {
+                gen_config_.top_k = k;
+                std::cout << "Top-k set to " << k << (k == 0 ? " (disabled)" : "") << "\n";
+            } else {
+                std::cout << "Usage: /top_k <0+> (0 = disabled)\n";
+            }
+        }
+        else if (command == "/top_p") {
+            f32 p;
+            if (iss >> p && p >= 0.0f && p <= 1.0f) {
+                gen_config_.top_p = p;
+                std::cout << "Top-p set to " << p << "\n";
+            } else {
+                std::cout << "Usage: /top_p <0.0-1.0>\n";
+            }
+        }
+        else if (command == "/min_p") {
+            f32 p;
+            if (iss >> p && p >= 0.0f && p <= 1.0f) {
+                gen_config_.min_p = p;
+                std::cout << "Min-p set to " << p << (p == 0.0f ? " (disabled)" : "") << "\n";
+            } else {
+                std::cout << "Usage: /min_p <0.0-1.0> (0 = disabled)\n";
+            }
+        }
+        else if (command == "/repeat") {
+            f32 r;
+            if (iss >> r && r >= 1.0f) {
+                gen_config_.repeat_penalty = r;
+                std::cout << "Repetition penalty set to " << r << "\n";
+            } else {
+                std::cout << "Usage: /repeat <1.0+> (1.0 = disabled)\n";
+            }
+        }
+        else if (command == "/dry") {
+            f32 d;
+            if (iss >> d && d >= 0.0f) {
+                gen_config_.dry_multiplier = d;
+                std::cout << "DRY multiplier set to " << d << (d == 0.0f ? " (disabled)" : "") << "\n";
+            } else {
+                std::cout << "Usage: /dry <0.0+> (0 = disabled)\n";
+            }
+        }
+        else if (command == "/mirostat") {
+            f32 tau;
+            if (iss >> tau && tau >= 0.0f) {
+                gen_config_.mirostat_tau = tau;
+                std::cout << "Mirostat v2 tau set to " << tau << (tau == 0.0f ? " (disabled)" : "") << "\n";
+            } else {
+                std::cout << "Usage: /mirostat <tau> (0 = disabled, typical: 3.0-5.0)\n";
+            }
+        }
+        else if (command == "/freq") {
+            f32 f;
+            if (iss >> f) {
+                gen_config_.frequency_penalty = f;
+                std::cout << "Frequency penalty set to " << f << "\n";
+            } else {
+                std::cout << "Usage: /freq <penalty> (0 = disabled)\n";
+            }
+        }
+        else if (command == "/pres") {
+            f32 p;
+            if (iss >> p) {
+                gen_config_.presence_penalty = p;
+                std::cout << "Presence penalty set to " << p << "\n";
+            } else {
+                std::cout << "Usage: /pres <penalty> (0 = disabled)\n";
             }
         }
         else if (command == "/reset") {

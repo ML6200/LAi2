@@ -92,6 +92,43 @@ public:
         return true;
     }
 
+    // Load vocabulary from memory buffer (for mmap)
+    bool load_from_memory(const u8* data, size_t len) {
+        if (!data || len < 12) return false;
+
+        size_t pos = 0;
+        auto read = [&](void* dst, size_t n) -> bool {
+            if (pos + n > len) return false;
+            std::memcpy(dst, data + pos, n);
+            pos += n;
+            return true;
+        };
+
+        u32 magic, version, vocab_size;
+        if (!read(&magic, 4) || !read(&version, 4) || !read(&vocab_size, 4))
+            return false;
+
+        if (magic != 0x4C414956) return false;  // "LAIV"
+
+        vocab_.resize(vocab_size);
+        token_to_id_.clear();
+        scores_.resize(vocab_size);
+
+        for (u32 i = 0; i < vocab_size; ++i) {
+            u32 token_len;
+            if (!read(&token_len, 4)) return false;
+
+            vocab_[i].resize(token_len);
+            if (!read(vocab_[i].data(), token_len)) return false;
+
+            if (!read(&scores_[i], 4)) return false;
+
+            token_to_id_[vocab_[i]] = i;
+        }
+
+        return true;
+    }
+
     // Save vocabulary to file
     bool save(const std::string& path) const {
         std::ofstream f(path, std::ios::binary);

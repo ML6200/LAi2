@@ -6,12 +6,14 @@
 #include "../model/transformer.h"
 #include "../model/config.h"
 #include "../tokenizer/bpe.h"
+#include "../backend/cpu_backend.h"
 #include "sampler.h"
 #include <string>
 #include <vector>
 #include <functional>
 #include <chrono>
 #include <iostream>
+#include <memory>
 
 namespace lai {
 
@@ -41,9 +43,18 @@ public:
     Engine() = default;
 
     // Initialize with model path (vocab is embedded in model)
-    bool init(const std::string& model_path, const std::string& vocab_path = "") {
-        // Load model with embedded vocabulary
-        if (!model_.load(model_path, &tokenizer_)) {
+    bool init(const std::string& model_path, const std::string& vocab_path = "",
+              bool use_mmap = true, const std::string& backend_name = "auto") {
+        // Try mmap first (zero-copy, instant startup)
+        bool loaded = false;
+        if (use_mmap) {
+            loaded = model_.load_mmap(model_path, &tokenizer_);
+        }
+        // Fall back to fread-based loading
+        if (!loaded) {
+            loaded = model_.load(model_path, &tokenizer_);
+        }
+        if (!loaded) {
             return false;
         }
 
@@ -61,6 +72,21 @@ public:
 
         logits_ = Tensor(Shape(model_.config().vocab_size));
         sampler_ = Sampler();
+
+        // Create compute backend
+        if (backend_name == "cpu") {
+            backend_.reset(Backend::create_cpu());
+        }
+#ifdef LAI_METAL
+        else if (backend_name == "metal") {
+            backend_.reset(Backend::create_metal());
+            if (!backend_) backend_.reset(Backend::create_cpu());
+        }
+#endif
+        else { // "auto"
+            backend_.reset(Backend::create_best());
+        }
+        model_.set_backend(backend_.get());
 
         return true;
     }
@@ -257,11 +283,16 @@ public:
         sampler_.set_seed(seed);
     }
 
+    const char* backend_name() const {
+        return backend_ ? backend_->name() : "none";
+    }
+
 private:
     Transformer model_;
     Tokenizer tokenizer_;
     Sampler sampler_;
     Tensor logits_;
+    std::unique_ptr<Backend> backend_;
 };
 
 } // namespace lai

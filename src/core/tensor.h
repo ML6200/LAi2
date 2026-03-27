@@ -74,7 +74,7 @@ public:
     // Create tensor with shape (allocates memory)
     explicit Tensor(Shape shape, DType dtype = DType::F32)
         : TensorView(nullptr, shape, dtype), owned_(true) {
-        size_t bytes = numel() * dtype_size(dtype);
+        size_t bytes = storage_bytes(numel(), dtype);
         // aligned_alloc requires size to be multiple of alignment
         size_t aligned_bytes = ((bytes + 63) / 64) * 64;
         if (aligned_bytes == 0) aligned_bytes = 64;  // Minimum allocation
@@ -117,7 +117,7 @@ public:
 
     // Allocate in arena (non-owning after creation)
     static Tensor from_arena(Arena& arena, Shape shape, DType dtype = DType::F32) {
-        size_t bytes = shape.numel() * dtype_size(dtype);
+        size_t bytes = storage_bytes(shape.numel(), dtype);
         void* data = arena.alloc(bytes);
         if (!data) throw std::bad_alloc();
         return Tensor(data, shape, dtype);
@@ -130,7 +130,7 @@ public:
 
     // Fill with zeros
     void zero() {
-        std::memset(data_, 0, numel() * dtype_size(dtype_));
+        std::memset(data_, 0, storage_bytes(numel(), dtype_));
     }
 
     bool owns_data() const { return owned_; }
@@ -181,6 +181,43 @@ inline void matvec(TensorView& y, const TensorView& A, const TensorView& x) {
 
     for (i64 i = 0; i < M; ++i) {
         yp[i] = simd::dot_f32(a + i * K, xp, K);
+    }
+}
+
+// Matrix-vector multiplication: y = A @ x (A is Q4_0, x is f32)
+inline void matvec_q4(TensorView& y, const TensorView& A, const TensorView& x) {
+    const i64 M = A.dim(0);
+    const i64 K = A.dim(1);
+    const Q4_0* a = static_cast<const Q4_0*>(A.data());
+    const f32* xp = x.data_f32();
+    f32* yp = y.data_f32();
+    const i64 blocks_per_row = K / 32;
+
+    for (i64 i = 0; i < M; ++i) {
+        yp[i] = simd::dot_q4_f32(a + i * blocks_per_row, xp, K);
+    }
+}
+
+// Matrix-vector multiplication: y = A @ x (A is Q8_0, x is f32)
+inline void matvec_q8(TensorView& y, const TensorView& A, const TensorView& x) {
+    const i64 M = A.dim(0);
+    const i64 K = A.dim(1);
+    const Q8_0* a = static_cast<const Q8_0*>(A.data());
+    const f32* xp = x.data_f32();
+    f32* yp = y.data_f32();
+    const i64 blocks_per_row = K / 32;
+
+    for (i64 i = 0; i < M; ++i) {
+        yp[i] = simd::dot_q8_f32(a + i * blocks_per_row, xp, K);
+    }
+}
+
+// Dispatch matvec based on weight dtype
+inline void matvec_dispatch(TensorView& y, const TensorView& A, const TensorView& x) {
+    switch (A.dtype()) {
+        case DType::Q4_0: matvec_q4(y, A, x); break;
+        case DType::Q8_0: matvec_q8(y, A, x); break;
+        default:          matvec(y, A, x);     break;
     }
 }
 

@@ -3,6 +3,8 @@
 
 #include "../core/tensor.h"
 #include "../core/allocator.h"
+#include "../core/mmap.h"
+#include "../backend/backend.h"
 #include "../tokenizer/bpe.h"
 #include "config.h"
 #include <vector>
@@ -134,8 +136,11 @@ public:
         allocate_buffers();
     }
 
-    // Load weights and vocabulary from file
+    // Load weights and vocabulary from file (fread into malloc'd memory)
     bool load(const std::string& path, Tokenizer* tokenizer = nullptr);
+
+    // Load weights via memory-mapping (zero-copy, OS-managed paging)
+    bool load_mmap(const std::string& path, Tokenizer* tokenizer = nullptr);
 
     // Forward pass for single token (autoregressive)
     void forward(Tensor& logits, i32 token, i32 pos);
@@ -184,6 +189,15 @@ private:
 
     i64 weights_bytes_ = 0;
     i64 buffers_bytes_ = 0;
+    DType weight_dtype_ = DType::F32;
+    MappedFile mapped_file_;  // Keeps mmap'd file alive
+    Backend* backend_ = nullptr;  // Optional GPU/compute backend
+
+public:
+    DType weight_dtype() const { return weight_dtype_; }
+    bool is_mmap() const { return mapped_file_.is_open(); }
+    void set_backend(Backend* b) { backend_ = b; }
+    Backend* backend() const { return backend_; }
 };
 
 // Implementation
@@ -216,9 +230,15 @@ inline void Transformer::attention(TensorView& output, const TensorView& input,
     const i32 kv_mul = n_heads / n_kv_heads;  // GQA multiplier
 
     // Compute Q, K, V projections
-    ops::matvec(buf_q_, layer.wq, input);
-    ops::matvec(buf_k_, layer.wk, input);
-    ops::matvec(buf_v_, layer.wv, input);
+    if (backend_) {
+        backend_->matvec(buf_q_, layer.wq, input);
+        backend_->matvec(buf_k_, layer.wk, input);
+        backend_->matvec(buf_v_, layer.wv, input);
+    } else {
+        ops::matvec_dispatch(buf_q_, layer.wq, input);
+        ops::matvec_dispatch(buf_k_, layer.wk, input);
+        ops::matvec_dispatch(buf_v_, layer.wv, input);
+    }
 
     // Apply RoPE to Q and K
     for (i32 h = 0; h < n_heads; ++h) {
@@ -261,23 +281,26 @@ inline void Transformer::attention(TensorView& output, const TensorView& input,
     }
 
     // Output projection
-    ops::matvec(output, layer.wo, buf_xb_);
+    if (backend_) backend_->matvec(output, layer.wo, buf_xb_);
+    else ops::matvec_dispatch(output, layer.wo, buf_xb_);
 }
 
 inline void Transformer::ffn(TensorView& output, const TensorView& input,
                              TransformerLayerWeights& layer) {
     // SwiGLU: output = down(silu(gate(x)) * up(x))
-    ops::matvec(buf_ffn_, layer.w_gate, input);
-    ops::matvec(buf_ffn2_, layer.w_up, input);
-
-    // SiLU activation on gate
-    ops::silu(buf_ffn_, buf_ffn_);
-
-    // Element-wise multiply
-    ops::mul(buf_ffn_, buf_ffn_, buf_ffn2_);
-
-    // Down projection
-    ops::matvec(output, layer.w_down, buf_ffn_);
+    if (backend_) {
+        backend_->matvec(buf_ffn_, layer.w_gate, input);
+        backend_->matvec(buf_ffn2_, layer.w_up, input);
+        backend_->silu(buf_ffn_, buf_ffn_);
+        backend_->mul(buf_ffn_, buf_ffn_, buf_ffn2_);
+        backend_->matvec(output, layer.w_down, buf_ffn_);
+    } else {
+        ops::matvec_dispatch(buf_ffn_, layer.w_gate, input);
+        ops::matvec_dispatch(buf_ffn2_, layer.w_up, input);
+        ops::silu(buf_ffn_, buf_ffn_);
+        ops::mul(buf_ffn_, buf_ffn_, buf_ffn2_);
+        ops::matvec_dispatch(output, layer.w_down, buf_ffn_);
+    }
 }
 
 inline void Transformer::forward(Tensor& logits, i32 token, i32 pos) {
@@ -297,29 +320,35 @@ inline void Transformer::forward(Tensor& logits, i32 token, i32 pos) {
         auto& layer = weights_.layers[l];
 
         // Pre-attention norm
-        ops::rmsnorm(buf_xb_, buf_x_, layer.attn_norm, config_.norm_eps);
+        if (backend_) backend_->rmsnorm(buf_xb_, buf_x_, layer.attn_norm, config_.norm_eps);
+        else ops::rmsnorm(buf_xb_, buf_x_, layer.attn_norm, config_.norm_eps);
 
         // Attention (writes to buf_xb_)
         attention(buf_xb_, buf_xb_, layer, l, pos);
 
         // Residual
-        ops::add(buf_x_, buf_x_, buf_xb_);
+        if (backend_) backend_->add(buf_x_, buf_x_, buf_xb_);
+        else ops::add(buf_x_, buf_x_, buf_xb_);
 
         // Pre-FFN norm
-        ops::rmsnorm(buf_xb_, buf_x_, layer.ffn_norm, config_.norm_eps);
+        if (backend_) backend_->rmsnorm(buf_xb_, buf_x_, layer.ffn_norm, config_.norm_eps);
+        else ops::rmsnorm(buf_xb_, buf_x_, layer.ffn_norm, config_.norm_eps);
 
         // FFN
         ffn(buf_xb_, buf_xb_, layer);
 
         // Residual
-        ops::add(buf_x_, buf_x_, buf_xb_);
+        if (backend_) backend_->add(buf_x_, buf_x_, buf_xb_);
+        else ops::add(buf_x_, buf_x_, buf_xb_);
     }
 
     // Final norm
-    ops::rmsnorm(buf_x_, buf_x_, weights_.final_norm, config_.norm_eps);
+    if (backend_) backend_->rmsnorm(buf_x_, buf_x_, weights_.final_norm, config_.norm_eps);
+    else ops::rmsnorm(buf_x_, buf_x_, weights_.final_norm, config_.norm_eps);
 
     // Output projection (logits)
-    ops::matvec(logits, weights_.output_weight, buf_x_);
+    if (backend_) backend_->matvec(logits, weights_.output_weight, buf_x_);
+    else ops::matvec_dispatch(logits, weights_.output_weight, buf_x_);
 }
 
 inline void Transformer::forward_sequence(Tensor& logits, const std::vector<i32>& tokens) {
@@ -354,55 +383,144 @@ inline bool Transformer::load(const std::string& path, Tokenizer* tokenizer) {
         }
     }
 
-    // Allocate weights
+    // Determine weight dtype from header
+    const DType wdtype = header.weight_dtype;
     const i32 dim = config_.dim;
     const i32 kv_dim = config_.kv_dim();
     const i32 hidden = config_.hidden_dim;
     const i32 vocab = config_.vocab_size;
 
-    weights_.token_embed = Tensor(Shape(vocab, dim));
-    weights_.output_weight = Tensor(Shape(vocab, dim));
-    weights_.final_norm = Tensor(Shape(dim));
+    // Embeddings and norms are always F32 (even for quantized models)
+    weights_.token_embed = Tensor(Shape(vocab, dim), DType::F32);
+    weights_.output_weight = Tensor(Shape(vocab, dim), DType::F32);
+    weights_.final_norm = Tensor(Shape(dim), DType::F32);
 
+    // Layer weights use the model's weight dtype
     weights_.layers.resize(config_.n_layers);
     for (i32 l = 0; l < config_.n_layers; ++l) {
         auto& layer = weights_.layers[l];
-        layer.wq = Tensor(Shape(dim, dim));
-        layer.wk = Tensor(Shape(kv_dim, dim));
-        layer.wv = Tensor(Shape(kv_dim, dim));
-        layer.wo = Tensor(Shape(dim, dim));
-        layer.w_gate = Tensor(Shape(hidden, dim));
-        layer.w_up = Tensor(Shape(hidden, dim));
-        layer.w_down = Tensor(Shape(dim, hidden));
-        layer.attn_norm = Tensor(Shape(dim));
-        layer.ffn_norm = Tensor(Shape(dim));
+        layer.wq = Tensor(Shape(dim, dim), wdtype);
+        layer.wk = Tensor(Shape(kv_dim, dim), wdtype);
+        layer.wv = Tensor(Shape(kv_dim, dim), wdtype);
+        layer.wo = Tensor(Shape(dim, dim), wdtype);
+        layer.w_gate = Tensor(Shape(hidden, dim), wdtype);
+        layer.w_up = Tensor(Shape(hidden, dim), wdtype);
+        layer.w_down = Tensor(Shape(dim, hidden), wdtype);
+        // Norms are always F32
+        layer.attn_norm = Tensor(Shape(dim), DType::F32);
+        layer.ffn_norm = Tensor(Shape(dim), DType::F32);
     }
 
-    // Read weights (simplified - real impl would handle quantization)
+    // Read weights from file
     fseek(f, header.weights_offset, SEEK_SET);
 
-    // Read embeddings
+    // Embeddings are always F32
     fread(weights_.token_embed.data(), sizeof(f32), vocab * dim, f);
     fread(weights_.output_weight.data(), sizeof(f32), vocab * dim, f);
     fread(weights_.final_norm.data(), sizeof(f32), dim, f);
 
-    // Read layer weights
+    // Layer weights: read raw bytes (F32 or quantized blocks)
     for (i32 l = 0; l < config_.n_layers; ++l) {
         auto& layer = weights_.layers[l];
-        fread(layer.wq.data(), sizeof(f32), dim * dim, f);
-        fread(layer.wk.data(), sizeof(f32), dim * kv_dim, f);
-        fread(layer.wv.data(), sizeof(f32), dim * kv_dim, f);
-        fread(layer.wo.data(), sizeof(f32), dim * dim, f);
-        fread(layer.w_gate.data(), sizeof(f32), dim * hidden, f);
-        fread(layer.w_up.data(), sizeof(f32), dim * hidden, f);
-        fread(layer.w_down.data(), sizeof(f32), hidden * dim, f);
+        auto read_weight = [&](Tensor& t) {
+            size_t bytes = storage_bytes(t.numel(), t.dtype());
+            fread(t.data(), 1, bytes, f);
+        };
+        read_weight(layer.wq);
+        read_weight(layer.wk);
+        read_weight(layer.wv);
+        read_weight(layer.wo);
+        read_weight(layer.w_gate);
+        read_weight(layer.w_up);
+        read_weight(layer.w_down);
+        // Norms are always F32
         fread(layer.attn_norm.data(), sizeof(f32), dim, f);
         fread(layer.ffn_norm.data(), sizeof(f32), dim, f);
     }
 
     fclose(f);
 
-    weights_bytes_ = config_.memory_bytes();
+    weights_bytes_ = config_.memory_bytes(wdtype);
+    weight_dtype_ = wdtype;
+    return true;
+}
+
+inline bool Transformer::load_mmap(const std::string& path, Tokenizer* tokenizer) {
+    if (!mapped_file_.open(path)) return false;
+
+    if (mapped_file_.size() < sizeof(ModelHeader)) {
+        mapped_file_.close();
+        return false;
+    }
+
+    // Read header from mapped memory
+    const auto* header = static_cast<const ModelHeader*>(mapped_file_.data());
+    if (!header->is_valid()) {
+        mapped_file_.close();
+        return false;
+    }
+
+    config_ = header->config;
+    kv_cache_.init(config_);
+    allocate_buffers();
+
+    // Load vocabulary from mapped memory if present
+    if (tokenizer && header->vocab_offset > 0) {
+        const u8* vocab_data = static_cast<const u8*>(mapped_file_.at(header->vocab_offset));
+        size_t vocab_len = header->weights_offset - header->vocab_offset;
+        if (!tokenizer->load_from_memory(vocab_data, vocab_len)) {
+            mapped_file_.close();
+            return false;
+        }
+    }
+
+    // Create non-owning tensors pointing into mapped memory
+    const DType wdtype = header->weight_dtype;
+    const i32 dim = config_.dim;
+    const i32 kv_dim = config_.kv_dim();
+    const i32 hidden = config_.hidden_dim;
+    const i32 vocab = config_.vocab_size;
+
+    const u8* ptr = static_cast<const u8*>(mapped_file_.at(header->weights_offset));
+
+    // Helper: create a non-owning tensor from the mapped data and advance pointer
+    auto map_tensor_f32 = [&](Shape shape) -> Tensor {
+        size_t bytes = storage_bytes(shape.numel(), DType::F32);
+        Tensor t(const_cast<void*>(static_cast<const void*>(ptr)), shape, DType::F32);
+        ptr += bytes;
+        return t;
+    };
+
+    auto map_tensor = [&](Shape shape, DType dt) -> Tensor {
+        size_t bytes = storage_bytes(shape.numel(), dt);
+        Tensor t(const_cast<void*>(static_cast<const void*>(ptr)), shape, dt);
+        ptr += bytes;
+        return t;
+    };
+
+    // Embeddings: always F32
+    weights_.token_embed = map_tensor_f32(Shape(vocab, dim));
+    weights_.output_weight = map_tensor_f32(Shape(vocab, dim));
+    weights_.final_norm = map_tensor_f32(Shape(dim));
+
+    // Layer weights
+    weights_.layers.resize(config_.n_layers);
+    for (i32 l = 0; l < config_.n_layers; ++l) {
+        auto& layer = weights_.layers[l];
+        layer.wq = map_tensor(Shape(dim, dim), wdtype);
+        layer.wk = map_tensor(Shape(kv_dim, dim), wdtype);
+        layer.wv = map_tensor(Shape(kv_dim, dim), wdtype);
+        layer.wo = map_tensor(Shape(dim, dim), wdtype);
+        layer.w_gate = map_tensor(Shape(hidden, dim), wdtype);
+        layer.w_up = map_tensor(Shape(hidden, dim), wdtype);
+        layer.w_down = map_tensor(Shape(dim, hidden), wdtype);
+        // Norms: always F32
+        layer.attn_norm = map_tensor_f32(Shape(dim));
+        layer.ffn_norm = map_tensor_f32(Shape(dim));
+    }
+
+    weights_bytes_ = config_.memory_bytes(wdtype);
+    weight_dtype_ = wdtype;
     return true;
 }
 
