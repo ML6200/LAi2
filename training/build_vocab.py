@@ -6,78 +6,104 @@ Uses byte-pair encoding to create 32K subword tokens
 
 import struct
 import argparse
+import pickle
+import os
 from collections import defaultdict, Counter
 from typing import List, Dict, Tuple
+from pathlib import Path
 import re
 
 
 class BPEVocabBuilder:
     """Build BPE vocabulary from text corpus"""
 
-    def __init__(self, vocab_size: int = 32000):
+    def __init__(self, vocab_size: int = 32000, checkpoint_path: str = "data/vocab_checkpoint.pkl"):
         self.vocab_size = vocab_size
         self.vocab = []
         self.scores = []
+        self.checkpoint_path = checkpoint_path
+
+    def save_checkpoint(self, words, stats, word_freqs, iteration):
+        """Save current training state to a pickle file"""
+        state = {
+            'vocab': self.vocab,
+            'scores': self.scores,
+            'words': words,
+            'stats': stats,
+            'word_freqs': word_freqs,
+            'iteration': iteration
+        }
+        temp_path = self.checkpoint_path + ".tmp"
+        with open(temp_path, 'wb') as f:
+            pickle.dump(state, f)
+        os.replace(temp_path, self.checkpoint_path)
+
+    def load_checkpoint(self):
+        """Load training state from pickle file if it exists"""
+        if os.path.exists(self.checkpoint_path):
+            print(f"  Found checkpoint at {self.checkpoint_path}. Resuming...")
+            with open(self.checkpoint_path, 'rb') as f:
+                return pickle.load(f)
+        return None
 
     def train(self, texts: List[str], min_freq: int = 2):
-        """Train BPE on text corpus (Optimized)"""
+        """Train BPE on text corpus (Optimized with Checkpoints)"""
         print(f"Training BPE vocabulary (target size: {self.vocab_size})...")
 
-        # Initialize with special tokens
-        self.vocab = ['<pad>', '<bos>', '<eos>', '<unk>']
-        self.scores = [0.0, 0.0, 0.0, 0.0]
+        checkpoint = self.load_checkpoint()
+        if checkpoint:
+            self.vocab = checkpoint['vocab']
+            self.scores = checkpoint['scores']
+            words = checkpoint['words']
+            stats = checkpoint['stats']
+            word_freqs = checkpoint['word_freqs']
+            start_iteration = checkpoint['iteration']
+            print(f"  Resuming from iteration {start_iteration} (vocab_size={len(self.vocab)})")
+        else:
+            # Initialize with special tokens
+            self.vocab = ['<pad>', '<bos>', '<eos>', '<unk>']
+            self.scores = [0.0, 0.0, 0.0, 0.0]
 
-        # Add byte tokens (256 tokens for raw bytes)
-        for i in range(256):
-            self.vocab.append(chr(i))
-            self.scores.append(-100.0)
+            # Add byte tokens (256 tokens for raw bytes)
+            for i in range(256):
+                self.vocab.append(chr(i))
+                self.scores.append(-100.0)
 
-        # Count frequencies of unique "words" (lines/sequences) to avoid redundant processing
-        word_freqs = Counter(texts)
-        
-        # Initial tokenization into characters
-        # We store each unique word as a list of symbols
-        stats = {} # (symbol1, symbol2) -> frequency
-        words = {} # unique_word_string -> [list, of, symbols]
-        
-        for word_str, freq in word_freqs.items():
-            # Initial split into characters (UTF-8 aware)
-            symbols = []
-            i = 0
-            while i < len(word_str):
-                char_len = self._utf8_char_len(ord(word_str[i]))
-                symbols.append(word_str[i:i+char_len])
-                i += char_len
+            # Count frequencies of unique "words"
+            word_freqs = Counter(texts)
+            stats = {} 
+            words = {} 
             
-            words[word_str] = symbols
-            # Initial pair counts
-            for i in range(len(symbols) - 1):
-                pair = (symbols[i], symbols[i+1])
-                stats[pair] = stats.get(pair, 0) + freq
-
-        print(f"  Processed {len(word_freqs)} unique sequences.")
-        print(f"  Initial unique symbols: {len(set(s for syms in words.values() for s in syms))}")
+            for word_str, freq in word_freqs.items():
+                symbols = []
+                i = 0
+                while i < len(word_str):
+                    char_len = self._utf8_char_len(ord(word_str[i]))
+                    symbols.append(word_str[i:i+char_len])
+                    i += char_len
+                
+                words[word_str] = symbols
+                for i in range(len(symbols) - 1):
+                    pair = (symbols[i], symbols[i+1])
+                    stats[pair] = stats.get(pair, 0) + freq
+            start_iteration = 0
 
         # BPE iterations
         max_token_len = 32
-        iteration = 0
-        target_merges = self.vocab_size - len(self.vocab)
+        iteration = start_iteration
         
         while len(self.vocab) < self.vocab_size:
             if not stats:
                 break
                 
-            # Find the most frequent pair
             best_pair = max(stats, key=stats.get)
             best_freq = stats[best_pair]
             
             if best_freq < min_freq:
                 break
                 
-            # Create new token
             new_token = best_pair[0] + best_pair[1]
             if len(new_token) > max_token_len:
-                # Skip this pair but remove it from stats so we don't pick it again
                 del stats[best_pair]
                 continue
                 
@@ -85,15 +111,12 @@ class BPEVocabBuilder:
             self.scores.append(float(best_freq))
             
             # Update 'words' and 'stats'
-            new_words = {}
             for word_str, symbols in words.items():
                 freq = word_freqs[word_str]
                 new_symbols = []
                 i = 0
                 while i < len(symbols):
                     if i < len(symbols) - 1 and symbols[i] == best_pair[0] and symbols[i+1] == best_pair[1]:
-                        # Perform merge
-                        # Update stats for pairs that will be broken
                         if i > 0:
                             stats[(symbols[i-1], symbols[i])] -= freq
                         if i < len(symbols) - 2:
@@ -101,7 +124,6 @@ class BPEVocabBuilder:
                                 stats[(symbols[i+1], symbols[i+2])] -= freq
                         
                         new_symbols.append(new_token)
-                        # Update stats for the new pair created
                         if i > 0:
                             stats[(symbols[i-1], new_token)] = stats.get((symbols[i-1], new_token), 0) + freq
                         
@@ -109,26 +131,26 @@ class BPEVocabBuilder:
                     else:
                         new_symbols.append(symbols[i])
                         i += 1
-                
-                # Update stats for potential new pairs at merge points
-                # (The logic above handles most, but let's re-verify pairs in the new sequence)
                 words[word_str] = new_symbols
             
-            # Re-calculating stats periodically to fix drift or complex merge overlaps
             if iteration % 100 == 0:
-                stats = {}
-                for word_str, symbols in words.items():
-                    freq = word_freqs[word_str]
-                    for i in range(len(symbols) - 1):
-                        pair = (symbols[i], symbols[i+1])
-                        stats[pair] = stats.get(pair, 0) + freq
-                
+                # Cleanup zero stats
+                stats = {k: v for k, v in stats.items() if v > 0}
                 print(f"  Iteration {iteration}: vocab_size={len(self.vocab)}, "
                       f"best_pair={repr(new_token[:20])}, freq={best_freq}")
-            
+                
+                # Save checkpoint every 500 iterations
+                if iteration % 500 == 0 and iteration > start_iteration:
+                    self.save_checkpoint(words, stats, word_freqs, iteration)
+
             iteration += 1
 
+        # Clean up checkpoint on success
+        if os.path.exists(self.checkpoint_path):
+            os.remove(self.checkpoint_path)
+            
         print(f"  Final vocabulary size: {len(self.vocab)}")
+
 
 
     def save(self, path: str):
