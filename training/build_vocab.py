@@ -20,7 +20,7 @@ class BPEVocabBuilder:
         self.scores = []
 
     def train(self, texts: List[str], min_freq: int = 2):
-        """Train BPE on text corpus"""
+        """Train BPE on text corpus (Optimized)"""
         print(f"Training BPE vocabulary (target size: {self.vocab_size})...")
 
         # Initialize with special tokens
@@ -30,85 +30,106 @@ class BPEVocabBuilder:
         # Add byte tokens (256 tokens for raw bytes)
         for i in range(256):
             self.vocab.append(chr(i))
-            self.scores.append(-100.0)  # Low priority
+            self.scores.append(-100.0)
 
-        print(f"  Added {len(self.vocab)} base tokens (special + bytes)")
-
-        # Count UTF-8 character frequencies
-        char_freq = Counter()
-        for text in texts:
+        # Count frequencies of unique "words" (lines/sequences) to avoid redundant processing
+        word_freqs = Counter(texts)
+        
+        # Initial tokenization into characters
+        # We store each unique word as a list of symbols
+        stats = {} # (symbol1, symbol2) -> frequency
+        words = {} # unique_word_string -> [list, of, symbols]
+        
+        for word_str, freq in word_freqs.items():
+            # Initial split into characters (UTF-8 aware)
+            symbols = []
             i = 0
-            while i < len(text):
-                char_len = self._utf8_char_len(ord(text[i]))
-                char = text[i:i+char_len]
-                char_freq[char] += 1
+            while i < len(word_str):
+                char_len = self._utf8_char_len(ord(word_str[i]))
+                symbols.append(word_str[i:i+char_len])
                 i += char_len
+            
+            words[word_str] = symbols
+            # Initial pair counts
+            for i in range(len(symbols) - 1):
+                pair = (symbols[i], symbols[i+1])
+                stats[pair] = stats.get(pair, 0) + freq
 
-        # Add frequent characters
-        for char, freq in char_freq.items():
-            if freq >= min_freq and char not in self.vocab:
-                self.vocab.append(char)
-                self.scores.append(float(freq))
-
-        print(f"  Added {len(self.vocab) - 260} frequent characters")
-
-        # Tokenize texts into characters
-        tokenized_texts = []
-        for text in texts:
-            chars = []
-            i = 0
-            while i < len(text):
-                char_len = self._utf8_char_len(ord(text[i]))
-                chars.append(text[i:i+char_len])
-                i += char_len
-            tokenized_texts.append(chars)
+        print(f"  Processed {len(word_freqs)} unique sequences.")
+        print(f"  Initial unique symbols: {len(set(s for syms in words.values() for s in syms))}")
 
         # BPE iterations
+        max_token_len = 32
         iteration = 0
-        max_token_len = 20  # Limit token length to prevent whole-line tokens
+        target_merges = self.vocab_size - len(self.vocab)
+        
         while len(self.vocab) < self.vocab_size:
-            # Count pair frequencies
-            pair_freq = Counter()
-            for tokens in tokenized_texts:
-                for i in range(len(tokens) - 1):
-                    # Skip if resulting token would be too long
-                    if len(tokens[i]) + len(tokens[i + 1]) > max_token_len:
-                        continue
-                    pair = (tokens[i], tokens[i + 1])
-                    pair_freq[pair] += 1
-
-            if not pair_freq:
+            if not stats:
                 break
-
-            # Find most frequent pair
-            best_pair, best_freq = pair_freq.most_common(1)[0]
-
+                
+            # Find the most frequent pair
+            best_pair = max(stats, key=stats.get)
+            best_freq = stats[best_pair]
+            
             if best_freq < min_freq:
                 break
-
+                
             # Create new token
             new_token = best_pair[0] + best_pair[1]
-            score = float(best_freq)
-
+            if len(new_token) > max_token_len:
+                # Skip this pair but remove it from stats so we don't pick it again
+                del stats[best_pair]
+                continue
+                
             self.vocab.append(new_token)
-            self.scores.append(score)
-
-            # Merge in all texts
-            for tokens in tokenized_texts:
+            self.scores.append(float(best_freq))
+            
+            # Update 'words' and 'stats'
+            new_words = {}
+            for word_str, symbols in words.items():
+                freq = word_freqs[word_str]
+                new_symbols = []
                 i = 0
-                while i < len(tokens) - 1:
-                    if tokens[i] == best_pair[0] and tokens[i + 1] == best_pair[1]:
-                        tokens[i] = new_token
-                        tokens.pop(i + 1)
+                while i < len(symbols):
+                    if i < len(symbols) - 1 and symbols[i] == best_pair[0] and symbols[i+1] == best_pair[1]:
+                        # Perform merge
+                        # Update stats for pairs that will be broken
+                        if i > 0:
+                            stats[(symbols[i-1], symbols[i])] -= freq
+                        if i < len(symbols) - 2:
+                            if not (symbols[i+1] == best_pair[0] and symbols[i+2] == best_pair[1]):
+                                stats[(symbols[i+1], symbols[i+2])] -= freq
+                        
+                        new_symbols.append(new_token)
+                        # Update stats for the new pair created
+                        if i > 0:
+                            stats[(symbols[i-1], new_token)] = stats.get((symbols[i-1], new_token), 0) + freq
+                        
+                        i += 2
                     else:
+                        new_symbols.append(symbols[i])
                         i += 1
-
-            iteration += 1
-            if iteration % 500 == 0:
+                
+                # Update stats for potential new pairs at merge points
+                # (The logic above handles most, but let's re-verify pairs in the new sequence)
+                words[word_str] = new_symbols
+            
+            # Re-calculating stats periodically to fix drift or complex merge overlaps
+            if iteration % 100 == 0:
+                stats = {}
+                for word_str, symbols in words.items():
+                    freq = word_freqs[word_str]
+                    for i in range(len(symbols) - 1):
+                        pair = (symbols[i], symbols[i+1])
+                        stats[pair] = stats.get(pair, 0) + freq
+                
                 print(f"  Iteration {iteration}: vocab_size={len(self.vocab)}, "
                       f"best_pair={repr(new_token[:20])}, freq={best_freq}")
+            
+            iteration += 1
 
         print(f"  Final vocabulary size: {len(self.vocab)}")
+
 
     def save(self, path: str):
         """Save vocabulary to binary file (C++ compatible format)"""

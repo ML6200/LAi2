@@ -54,29 +54,42 @@ struct ModelConfig {
 // Preset configurations
 namespace presets {
 
-// LAi-Mini: ~150M params, fits in 4GB RAM with Q4
-inline ModelConfig lai_mini() {
+// LAi-Micro: ~10M params, ultra-low-end hardware (64MB RAM)
+inline ModelConfig lai_micro() {
     ModelConfig cfg;
-    cfg.dim = 512;
-    cfg.hidden_dim = 2048;
-    cfg.n_layers = 12;
-    cfg.n_heads = 8;
-    cfg.n_kv_heads = 8;
-    cfg.vocab_size = 32000;
-    cfg.max_seq_len = 1024;
+    cfg.dim = 288;
+    cfg.hidden_dim = 768;
+    cfg.n_layers = 6;
+    cfg.n_heads = 6;
+    cfg.n_kv_heads = 2;
+    cfg.vocab_size = 16000;
+    cfg.max_seq_len = 256;
     return cfg;
 }
 
-// LAi-Tiny: ~50M params, ultra-low memory
+// LAi-Tiny: ~30M params, low-end hardware (128MB RAM)
 inline ModelConfig lai_tiny() {
     ModelConfig cfg;
     cfg.dim = 384;
-    cfg.hidden_dim = 1536;
+    cfg.hidden_dim = 1152;
     cfg.n_layers = 8;
     cfg.n_heads = 6;
-    cfg.n_kv_heads = 6;
+    cfg.n_kv_heads = 2;
     cfg.vocab_size = 32000;
     cfg.max_seq_len = 512;
+    return cfg;
+}
+
+// LAi-Mini: ~100M params, fits in 4GB RAM with Q4
+inline ModelConfig lai_mini() {
+    ModelConfig cfg;
+    cfg.dim = 512;
+    cfg.hidden_dim = 1536;
+    cfg.n_layers = 12;
+    cfg.n_heads = 8;
+    cfg.n_kv_heads = 4;
+    cfg.vocab_size = 32000;
+    cfg.max_seq_len = 1024;
     return cfg;
 }
 
@@ -84,10 +97,10 @@ inline ModelConfig lai_tiny() {
 inline ModelConfig lai_small() {
     ModelConfig cfg;
     cfg.dim = 768;
-    cfg.hidden_dim = 3072;
+    cfg.hidden_dim = 2304;
     cfg.n_layers = 16;
     cfg.n_heads = 12;
-    cfg.n_kv_heads = 12;
+    cfg.n_kv_heads = 4;
     cfg.vocab_size = 32000;
     cfg.max_seq_len = 2048;
     return cfg;
@@ -102,6 +115,13 @@ struct GenerationConfig {
     f32 top_p = 0.9f;           // Nucleus sampling threshold
     i32 top_k = 40;             // Top-k sampling
     f32 repeat_penalty = 1.1f;  // Repetition penalty
+    f32 min_p = 0.0f;              // Min-p threshold (0 = disabled)
+    f32 frequency_penalty = 0.0f;  // Count-based frequency penalty
+    f32 presence_penalty = 0.0f;   // Binary presence penalty
+    f32 dry_multiplier = 0.0f;     // DRY n-gram penalty (0 = disabled)
+    i32 dry_allowed_length = 2;    // Minimum n-gram length for DRY
+    f32 mirostat_tau = 0.0f;       // Mirostat v2 target surprise (0 = disabled)
+    f32 mirostat_eta = 0.1f;       // Mirostat v2 learning rate
     i32 seed = -1;              // Random seed (-1 = random)
 
     // Stop tokens

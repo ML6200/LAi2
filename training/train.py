@@ -39,16 +39,20 @@ class ModelConfig:
     norm_eps: float = 1e-5
 
     @staticmethod
-    def mini():
-        return ModelConfig(dim=512, hidden_dim=2048, n_layers=12, n_heads=8, vocab_size=32000, max_seq_len=1024)
+    def micro():
+        return ModelConfig(dim=288, hidden_dim=768, n_layers=6, n_heads=6, n_kv_heads=2, vocab_size=32000, max_seq_len=256)
 
     @staticmethod
     def tiny():
-        return ModelConfig(dim=384, hidden_dim=1536, n_layers=8, n_heads=6, n_kv_heads=6, vocab_size=32000, max_seq_len=512)
+        return ModelConfig(dim=384, hidden_dim=1152, n_layers=8, n_heads=6, n_kv_heads=2, vocab_size=32000, max_seq_len=512)
+
+    @staticmethod
+    def mini():
+        return ModelConfig(dim=512, hidden_dim=1536, n_layers=12, n_heads=8, n_kv_heads=4, vocab_size=32000, max_seq_len=1024)
 
     @staticmethod
     def small():
-        return ModelConfig(dim=768, hidden_dim=3072, n_layers=16, n_heads=12, vocab_size=32000, max_seq_len=2048)
+        return ModelConfig(dim=768, hidden_dim=2304, n_layers=16, n_heads=12, n_kv_heads=4, vocab_size=32000, max_seq_len=2048)
 
 
 class RMSNorm(nn.Module):
@@ -515,8 +519,12 @@ def export_model(model: Transformer, tokenizer: BPETokenizer, path: str):
 
 
 def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
-          epochs: int = 10, batch_size: int = 4, lr: float = 3e-4, device: str = "cuda"):
+          epochs: int = 10, batch_size: int = 4, lr: float = 3e-4, device: str = "cuda",
+          output_path: str = "models/lai.bin"):
     """Train the model"""
+    checkpoint_dir = Path("checkpoints")
+    checkpoint_dir.mkdir(exist_ok=True)
+
     print(f"Training LAi model:")
     print(f"  Config: {config.dim}d, {config.n_layers}L, {config.n_heads}H")
     print(f"  Device: {device}")
@@ -612,12 +620,16 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} complete. Average loss: {avg_loss:.4f}")
 
+        # Save checkpoint
+        checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch+1}.bin"
+        export_model(model, tokenizer, str(checkpoint_path))
+
     return model
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train LAi model")
-    parser.add_argument("--config", choices=["tiny", "mini", "small"], default="mini")
+    parser.add_argument("--config", choices=["micro", "tiny", "mini", "small"], default="mini")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -629,7 +641,9 @@ def main():
     args = parser.parse_args()
 
     # Get config
-    if args.config == "tiny":
+    if args.config == "micro":
+        config = ModelConfig.micro()
+    elif args.config == "tiny":
         config = ModelConfig.tiny()
     elif args.config == "small":
         config = ModelConfig.small()
@@ -666,7 +680,7 @@ def main():
         ] * 1000  # Repeat for more training data
 
     # Train
-    model = train(config, texts, tokenizer, args.epochs, args.batch_size, args.lr, args.device)
+    model = train(config, texts, tokenizer, args.epochs, args.batch_size, args.lr, args.device, args.output)
 
     # Export (vocabulary is embedded in model file now)
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)

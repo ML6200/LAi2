@@ -256,18 +256,24 @@ def create_instruction_data(texts: List[str]) -> List[str]:
         ("What is the main idea of this text?", "Mi a fő gondolata ennek a szövegnek?"),
         ("Explain this in simple terms:", "Magyarázd el egyszerűen:"),
         ("Continue this text:", "Folytasd ezt a szöveget:"),
+        ("Translate this to Hungarian:", "Fordítsd le magyarra:"),
+        ("Translate this to English:", "Fordítsd le angolra:"),
+        ("Rewrite this text in a formal tone:", "Írd át ezt a szöveget hivatalos stílusban:"),
+        ("Extract the key entities from this text:", "Gyűjtsd ki a legfontosabb entitásokat ebből a szövegből:"),
     ]
 
     for text in texts[:len(texts)//2]:
-        if len(text) > 100:
+        if 100 < len(text) < 2000:
             template_en, template_hu = random.choice(templates)
+            
+            is_hu = any(c in text for c in 'áéíóöőúüűÁÉÍÓÖŐÚÜŰ')
 
-            # English instruction
-            instructions.append(f"<user>{template_en}\n\n{text[:500]}</user><assistant>")
-
-            # Hungarian instruction (for Hungarian texts)
-            if any(c in text for c in 'áéíóöőúüű'):
-                instructions.append(f"<user>{template_hu}\n\n{text[:500]}</user><assistant>")
+            if is_hu:
+                # Hungarian instruction for Hungarian text
+                instructions.append(f"<user>{template_hu}\n\n{text}</user><assistant>")
+            else:
+                # English instruction for English text
+                instructions.append(f"<user>{template_en}\n\n{text}</user><assistant>")
 
     return instructions
 
@@ -275,7 +281,7 @@ def create_instruction_data(texts: List[str]) -> List[str]:
 def main():
     parser = argparse.ArgumentParser(description="Prepare training data for LAi")
     parser.add_argument("--output", type=str, default="data/train.txt", help="Output file path")
-    parser.add_argument("--size", choices=["tiny", "small", "medium", "large"], default="small")
+    parser.add_argument("--size", choices=["micro", "tiny", "small", "medium", "large"], default="small")
     parser.add_argument("--hu_wiki", type=int, default=None, help="Number of Hungarian Wikipedia articles")
     parser.add_argument("--hu_oscar", type=int, default=None, help="Number of Hungarian OSCAR documents")
     parser.add_argument("--en_stories", type=int, default=None, help="Number of English stories")
@@ -284,10 +290,11 @@ def main():
 
     # Set sizes based on preset
     size_presets = {
-        "tiny": {"hu_wiki": 1000, "hu_oscar": 1000, "en_stories": 5000, "translations": 1000},
-        "small": {"hu_wiki": 5000, "hu_oscar": 5000, "en_stories": 20000, "translations": 5000},
-        "medium": {"hu_wiki": 20000, "hu_oscar": 20000, "en_stories": 50000, "translations": 10000},
-        "large": {"hu_wiki": 50000, "hu_oscar": 50000, "en_stories": 100000, "translations": 20000},
+        "micro": {"hu_wiki": 500, "hu_oscar": 500, "en_stories": 2000, "translations": 500},
+        "tiny": {"hu_wiki": 2000, "hu_oscar": 2000, "en_stories": 10000, "translations": 2000},
+        "small": {"hu_wiki": 10000, "hu_oscar": 10000, "en_stories": 40000, "translations": 10000},
+        "medium": {"hu_wiki": 40000, "hu_oscar": 40000, "en_stories": 100000, "translations": 25000},
+        "large": {"hu_wiki": 100000, "hu_oscar": 100000, "en_stories": 250000, "translations": 50000},
     }
 
     preset = size_presets[args.size]
