@@ -213,37 +213,12 @@ class Transformer(nn.Module):
         h = self.norm(h)
 
         if targets is not None:
-            # Memory optimization: Compute loss in chunks to avoid materializing full logits
-            # Full logits: [B, T, V] -> 32*1024*32000 * 2 bytes = ~2GB
-            # Chunked: Process small segments at a time
-            logits = None # We don't return full logits during training to save memory
-            loss = 0.0
-            chunk_size = 64 # Small chunk size
-            
-            # Flatten for easier chunking
-            h_flat = h.view(-1, self.config.dim)
-            targets_flat = targets.view(-1)
-            
-            for i in range(0, h_flat.size(0), chunk_size):
-                end = min(i + chunk_size, h_flat.size(0))
-                h_chunk = h_flat[i:end]
-                t_chunk = targets_flat[i:end]
-                
-                # Compute logits only for this chunk
-                logits_chunk = self.output(h_chunk)
-                
-                # Compute loss for this chunk
-                loss_chunk = F.cross_entropy(logits_chunk, t_chunk, ignore_index=-100, reduction='sum')
-                loss += loss_chunk
-            
-            # Average the loss
-            # Note: We should technically divide by (total_tokens - ignored_tokens), 
-            # but usually dividing by total_tokens is close enough or we can count.
-            # Here we divide by batch_size * seq_len for simplicity and consistency with standard mean reduction
-            loss = loss / (bsz * seqlen)
-            
+            # Full parallel loss calculation for CPU/GPU efficiency
+            logits = self.output(h)
+            # Flatten to [batch*seq, vocab]
+            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1), ignore_index=-100)
         else:
-            # Inference mode: only compute last token logits usually, but here we do all
+            # Inference mode: only compute last token logits usually
             logits = self.output(h)
             loss = None
 
@@ -519,13 +494,14 @@ def export_model(model: Transformer, tokenizer: BPETokenizer, path: str):
 
 
 def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
-          epochs: int = 10, batch_size: int = 4, lr: float = 3e-4, device: str = "cuda",
-          output_path: str = "models/lai.bin"):
+          epochs: int, batch_size: int, lr: float, device: str,
+          output_path: str):
     """Train the model"""
     # CPU Optimization for Xeon
     if device == "cpu":
         num_threads = psutil.cpu_count(logical=False)
         torch.set_num_threads(num_threads)
+        torch.set_num_interop_threads(1) # Usually best for single-node CPU training
         print(f"  CPU Training: Using {num_threads} threads")
 
     checkpoint_dir = Path("checkpoints")
