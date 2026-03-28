@@ -14,6 +14,7 @@ import struct
 import argparse
 import psutil
 import multiprocessing
+import numpy as np
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from pathlib import Path
@@ -253,43 +254,64 @@ def tokenize_worker(args):
     return results
 
 class TextDataset(Dataset):
-    """Simple text dataset for training (Parallel Optimized)"""
+    """Simple text dataset for training (Parallel Optimized + Cached)"""
     def __init__(self, texts: List[str], tokenizer_path: str, max_len: int = 512):
-        print(f"  Tokenizing {len(texts)} lines using {multiprocessing.cpu_count()} cores...")
+        cache_path = Path(tokenizer_path).with_suffix('.dataset.bin')
         
-        # Parallel tokenization
-        num_cores = multiprocessing.cpu_count()
-        with multiprocessing.Pool(num_cores) as pool:
-            # Map tokenize_worker across texts
-            worker_args = [(text, tokenizer_path, max_len) for text in texts]
+        if cache_path.exists():
+            print(f"  Loading cached dataset from {cache_path}...")
+            # Use numpy to read binary file quickly
+            tokens_np = np.fromfile(cache_path, dtype=np.int32)
+            self.data = torch.from_numpy(tokens_np).long()
             
-            if tqdm:
-                results = list(tqdm(pool.imap(tokenize_worker, worker_args), total=len(texts), desc="  Tokenizing"))
-            else:
-                results = pool.map(tokenize_worker, worker_args)
+            # Since we cache as fixed-length blocks for efficiency
+            block_size = max_len + 1
+            num_blocks = len(self.data) // block_size
+            self.slices = [(i * block_size, block_size) for i in range(num_blocks)]
+            print(f"  Loaded {len(self.slices)} fixed-size blocks from cache.")
+        else:
+            print(f"  Tokenizing {len(texts)} lines using {multiprocessing.cpu_count()} cores...")
+            num_cores = multiprocessing.cpu_count()
+            with multiprocessing.Pool(num_cores) as pool:
+                worker_args = [(text, tokenizer_path, max_len) for text in texts]
+                if tqdm:
+                    results = list(tqdm(pool.imap(tokenize_worker, worker_args), total=len(texts), desc="  Tokenizing"))
+                else:
+                    results = pool.map(tokenize_worker, worker_args)
 
-        # Flatten results and track slices
-        all_tokens = []
-        self.slices = []
-        current_offset = 0
-        
-        for text_chunks in results:
-            for chunk in text_chunks:
-                all_tokens.extend(chunk)
-                self.slices.append((current_offset, len(chunk)))
-                current_offset += len(chunk)
+            all_tokens = []
+            self.slices = []
+            current_offset = 0
+            
+            block_size = max_len + 1
+            for text_chunks in results:
+                for chunk in text_chunks:
+                    # Pad to fixed length for simplified loading and caching
+                    if len(chunk) < block_size:
+                        chunk = chunk + [0] * (block_size - len(chunk))
+                    else:
+                        chunk = chunk[:block_size]
+                    
+                    all_tokens.extend(chunk)
+                    self.slices.append((current_offset, block_size))
+                    current_offset += block_size
 
-        self.data = torch.tensor(all_tokens, dtype=torch.long)
-        print(f"  Dataset: {len(self.slices)} samples, {len(self.data)} tokens loaded.")
+            # Save to binary file (int32)
+            tokens_np = np.array(all_tokens, dtype=np.int32)
+            print(f"  Saving dataset cache to {cache_path}...")
+            tokens_np.tofile(cache_path)
+            
+            self.data = torch.from_numpy(tokens_np).long()
+            print(f"  Dataset: {len(self.slices)} samples, {len(self.data)} tokens loaded.")
 
     def __len__(self):
         return len(self.slices)
 
     def __getitem__(self, idx):
         start, length = self.slices[idx]
-        chunk = self.data[start : start + length]
-        x = chunk[:-1]
-        y = chunk[1:]
+        # Avoid creating intermediate slices, directly get x and y
+        x = self.data[start : start + length - 1]
+        y = self.data[start + 1 : start + length]
         return x, y
 
 
@@ -557,11 +579,15 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                            collate_fn=collate_fn, num_workers=num_workers,
-                           pin_memory=pin_memory)
+                           pin_memory=pin_memory, prefetch_factor=2 if num_workers > 0 else None,
+                           persistent_workers=True if num_workers > 0 else False)
     print(f"  Training samples: {len(dataset)}")
 
     # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), weight_decay=0.1)
+    # Fused AdamW is significantly faster on most hardware
+    use_fused = device == "cuda" or (device == "mps" and torch.backends.mps.is_available())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), 
+                                 weight_decay=0.1, fused=use_fused)
 
     # Learning rate scheduler
     warmup_steps = 100
@@ -595,7 +621,7 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     for epoch in range(epochs):
         total_loss = 0
         for batch_idx, (x, y) in enumerate(dataloader):
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             optimizer.zero_grad()
 
