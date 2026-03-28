@@ -632,8 +632,10 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
         progress = (step - warmup_steps) / (total_steps - warmup_steps)
         return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    # Mixed precision (also enable BF16 autocast on CPU for Xeon with AVX2+)
-    use_amp = True
+    # Mixed precision: CUDA/MPS benefit from float16 autocast.
+    # CPU autocast (BF16) only helps on CPUs with native BF16 (Cooper Lake+, Sapphire Rapids+).
+    # Broadwell/Skylake Xeons don't have BF16 and autocast causes hangs or slow emulation.
+    use_amp = device != 'cpu'
     device_type = 'cuda' if 'cuda' in device else ('cpu' if 'cpu' in device else 'mps')
     
     # GradScaler only works with CUDA (not MPS or CPU)
