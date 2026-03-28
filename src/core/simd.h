@@ -364,48 +364,43 @@ inline void dequantize_q1_block(const Q1_0* block, f32* out) {
 }
 
 // Dequantize a Q4_0 block (32 elements) to f32
-...
+inline void dequantize_q4_block(const Q4_0* block, f32* out) {
+    const f32 d = f16_to_f32(block->d);
+    for (i32 j = 0; j < 16; ++j) {
+        i32 lo = (block->qs[j] & 0x0F) - 8;
+        i32 hi = ((block->qs[j] >> 4) & 0x0F) - 8;
+        out[j * 2]     = d * static_cast<f32>(lo);
+        out[j * 2 + 1] = d * static_cast<f32>(hi);
+    }
+}
+
+// Dequantize a Q8_0 block (32 elements) to f32
+inline void dequantize_q8_block(const Q8_0* block, f32* out) {
+    const f32 d = f16_to_f32(block->d);
+    for (i32 j = 0; j < 32; ++j) {
+        out[j] = d * static_cast<f32>(block->qs[j]);
+    }
+}
+
 // Dot product: Q1_0 weights @ f32 activations
 // n is the number of logical elements (must be multiple of 32)
 inline f32 dot_q1_f32(const Q1_0* a, const f32* b, i64 n) {
     f32 sum = 0.0f;
     i64 num_blocks = n / 32;
 
-#if defined(LAI_AVX2)
-    const __m256i m1 = _mm256_set1_epi32(1);
-    const __m256i mask3 = _mm256_set1_epi32(3);
-
     for (i64 i = 0; i < num_blocks; ++i) {
         const f32 d = f16_to_f32(a[i].d);
-        __m256 acc = _mm256_setzero_ps();
-        const f32* bp = b + i * 32;
-
-        for (i32 j = 0; j < 8; j += 2) {
-            // Load 2 bytes = 8 ternary weights
-            u16 w16;
-            std::memcpy(&w16, &a[i].qs[j], 2);
-
-            // Extract 8 x 2-bit values into i32 lanes
-            // This is a simplified version of the logic
-            for (i32 k = 0; k < 8; ++k) {
-                f32 val = static_cast<f32>(((w16 >> (k * 2)) & 0x03) - 1);
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(val), _mm256_loadu_ps(bp + j * 4 + k), acc);
+        f32 block_sum = 0.0f;
+        for (i32 j = 0; j < 8; ++j) {
+            for (i32 k = 0; k < 4; ++k) {
+                i32 val = ((a[i].qs[j] >> (k * 2)) & 0x03) - 1;
+                block_sum += static_cast<f32>(val) * b[i * 32 + j * 4 + k];
             }
-            // Wait, the above is not efficient because of set1_ps and 8 iterations.
-            // Let's do it better in a follow-up if needed, for now this works.
         }
-        // ... horizontal sum omitted for brevity in this step, 
-        // will implement full optimized version in next turn.
+        sum += block_sum * d;
     }
-#endif
-    return sum;
-}
 
-// Dot product: Q4_0 weights @ f32 activations
-    const f32 d = f16_to_f32(block->d);
-    for (i32 j = 0; j < 32; ++j) {
-        out[j] = d * static_cast<f32>(block->qs[j]);
-    }
+    return sum;
 }
 
 // Dot product: Q4_0 weights @ f32 activations
