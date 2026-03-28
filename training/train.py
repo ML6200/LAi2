@@ -578,13 +578,11 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     model = Transformer(config).to(device)
     print(f"  Parameters: {model.num_params() / 1e6:.1f}M")
 
-    # torch.compile for PyTorch 2.0+ (works on CPU, CUDA, and MPS)
-    if hasattr(torch, 'compile'):
+    # torch.compile for PyTorch 2.0+ (skip CPU — compilation overhead exceeds gains for small models)
+    if hasattr(torch, 'compile') and device != 'cpu':
         try:
             if device == 'cuda':
                 compile_backend = 'inductor'
-            elif device == 'cpu':
-                compile_backend = 'inductor'  # inductor generates optimized C++ kernels for CPU
             else:
                 compile_backend = 'aot_eager'
             model = torch.compile(model, backend=compile_backend)
