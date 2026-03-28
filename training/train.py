@@ -572,17 +572,17 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
         progress = (step - warmup_steps) / (total_steps - warmup_steps)
         return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-# Mixed precision
-use_amp = device != 'cpu'
-device_type = 'cuda' if 'cuda' in device else ('cpu' if 'cpu' in device else 'mps')
-
-# Handle MPS (Apple Silicon)
-if device == 'mps':
-    use_amp = True # Newer PyTorch supports MPS autocast
-    # Disable GradScaler for MPS due to float64 bugs in some torch versions
-    scaler = None
-else:
-    scaler = GradScaler(device_type) if use_amp else None
+    # Mixed precision
+    use_amp = device != 'cpu'
+    device_type = 'cuda' if 'cuda' in device else ('cpu' if 'cpu' in device else 'mps')
+    
+    # Handle MPS (Apple Silicon)
+    if device == 'mps':
+        use_amp = True # Newer PyTorch supports MPS autocast
+        # Disable GradScaler for MPS due to float64 bugs in some torch versions
+        scaler = None
+    else:
+        scaler = GradScaler(device_type) if use_amp else None
 
     # Training loop
     model.train()
