@@ -47,7 +47,7 @@ class BPEVocabBuilder:
         return None
 
     def train(self, texts: List[str], min_freq: int = 2):
-        """Train BPE on text corpus (Optimized with Checkpoints)"""
+        """Train BPE on text corpus (High-Performance with Checkpoints)"""
         print(f"Training BPE vocabulary (target size: {self.vocab_size})...")
 
         checkpoint = self.load_checkpoint()
@@ -71,7 +71,7 @@ class BPEVocabBuilder:
 
             # Count frequencies of unique "words"
             word_freqs = Counter(texts)
-            stats = {} 
+            stats = defaultdict(int) 
             words = {} 
             
             for word_str, freq in word_freqs.items():
@@ -85,8 +85,16 @@ class BPEVocabBuilder:
                 words[word_str] = symbols
                 for i in range(len(symbols) - 1):
                     pair = (symbols[i], symbols[i+1])
-                    stats[pair] = stats.get(pair, 0) + freq
+                    stats[pair] += freq
             start_iteration = 0
+
+        # Create inverse index: pair -> set of word_strings that contain it
+        print("  Building inverse index...")
+        pair_to_words = defaultdict(set)
+        for word_str, symbols in words.items():
+            for i in range(len(symbols) - 1):
+                pair = (symbols[i], symbols[i+1])
+                pair_to_words[pair].add(word_str)
 
         # BPE iterations
         max_token_len = 32
@@ -96,6 +104,7 @@ class BPEVocabBuilder:
             if not stats:
                 break
                 
+            # Find the most frequent pair
             best_pair = max(stats, key=stats.get)
             best_freq = stats[best_pair]
             
@@ -105,27 +114,48 @@ class BPEVocabBuilder:
             new_token = best_pair[0] + best_pair[1]
             if len(new_token) > max_token_len:
                 del stats[best_pair]
+                # Cleanup pair_to_words for this pair
+                if best_pair in pair_to_words:
+                    del pair_to_words[best_pair]
                 continue
                 
             self.vocab.append(new_token)
             self.scores.append(float(best_freq))
             
-            # Update 'words' and 'stats'
-            for word_str, symbols in words.items():
+            # Update only words that contain the best_pair
+            affected_words = pair_to_words[best_pair]
+            for word_str in list(affected_words):
+                symbols = words[word_str]
                 freq = word_freqs[word_str]
+                
                 new_symbols = []
                 i = 0
                 while i < len(symbols):
                     if i < len(symbols) - 1 and symbols[i] == best_pair[0] and symbols[i+1] == best_pair[1]:
+                        # Remove old pairs from stats and inverse index
                         if i > 0:
-                            stats[(symbols[i-1], symbols[i])] -= freq
+                            old_pair = (symbols[i-1], symbols[i])
+                            stats[old_pair] -= freq
+                            # We don't remove from pair_to_words immediately to avoid slow set operations
+                        if i < len(symbols) - 2:
+                            # Avoid double counting if the next pair is also the best_pair
+                            if not (symbols[i+1] == best_pair[0] and symbols[i+2] == best_pair[1]):
+                                old_pair = (symbols[i+1], symbols[i+2])
+                                stats[old_pair] -= freq
+                        
+                        # Merge
+                        new_symbols.append(new_token)
+                        
+                        # Add new pairs to stats and inverse index
+                        if i > 0:
+                            new_pair = (symbols[i-1], new_token)
+                            stats[new_pair] += freq
+                            pair_to_words[new_pair].add(word_str)
                         if i < len(symbols) - 2:
                             if not (symbols[i+1] == best_pair[0] and symbols[i+2] == best_pair[1]):
-                                stats[(symbols[i+1], symbols[i+2])] -= freq
-                        
-                        new_symbols.append(new_token)
-                        if i > 0:
-                            stats[(symbols[i-1], new_token)] = stats.get((symbols[i-1], new_token), 0) + freq
+                                new_pair = (new_token, symbols[i+2])
+                                stats[new_pair] += freq
+                                pair_to_words[new_pair].add(word_str)
                         
                         i += 2
                     else:
@@ -133,14 +163,30 @@ class BPEVocabBuilder:
                         i += 1
                 words[word_str] = new_symbols
             
-            if iteration % 100 == 0:
-                # Cleanup zero stats
-                stats = {k: v for k, v in stats.items() if v > 0}
+            # Cleanup the merged pair
+            del stats[best_pair]
+            del pair_to_words[best_pair]
+
+            # Periodic cleanup and recount to fix drift and maintain speed
+            if iteration % 200 == 0:
+                # Cleanup zero or negative stats
+                stats = defaultdict(int, {k: v for k, v in stats.items() if v > 0})
+                
+                # Rebuild inverse index to remove dead references and keep it small
+                new_pair_to_words = defaultdict(set)
+                for pair, count in stats.items():
+                    # Only keep pairs that still exist in words
+                    for word_str in pair_to_words[pair]:
+                        # Quick check if pair still in symbols of this word
+                        if any(pair[0] == words[word_str][i] and pair[1] == words[word_str][i+1] 
+                               for i in range(len(words[word_str])-1)):
+                            new_pair_to_words[pair].add(word_str)
+                pair_to_words = new_pair_to_words
+
                 print(f"  Iteration {iteration}: vocab_size={len(self.vocab)}, "
                       f"best_pair={repr(new_token[:20])}, freq={best_freq}")
                 
-                # Save checkpoint every 500 iterations
-                if iteration % 500 == 0 and iteration > start_iteration:
+                if iteration % 1000 == 0 and iteration > start_iteration:
                     self.save_checkpoint(words, stats, word_freqs, iteration)
 
             iteration += 1
