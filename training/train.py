@@ -351,7 +351,12 @@ class BPETokenizer:
 
             for i in range(vocab_size):
                 token_len = struct.unpack('I', f.read(4))[0]
-                token = f.read(token_len).decode('utf-8')
+                raw = f.read(token_len)
+                # Byte tokens (indices 4-259) are stored as raw single bytes
+                if 4 <= i < 260:
+                    token = chr(i - 4)
+                else:
+                    token = raw.decode('utf-8')
                 score = struct.unpack('f', f.read(4))[0]
 
                 self.vocab.append(token)
