@@ -572,15 +572,16 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
         progress = (step - warmup_steps) / (total_steps - warmup_steps)
         return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+# Mixed precision
+use_amp = device != 'cpu'
+device_type = 'cuda' if 'cuda' in device else ('cpu' if 'cpu' in device else 'mps')
 
-    # Mixed precision
-    use_amp = device != 'cpu'
-    device_type = 'cuda' if 'cuda' in device else ('cpu' if 'cpu' in device else 'mps')
-    
-    # Handle MPS (Apple Silicon)
-    if device == 'mps':
-        use_amp = True # Newer PyTorch supports MPS autocast
-        
+# Handle MPS (Apple Silicon)
+if device == 'mps':
+    use_amp = True # Newer PyTorch supports MPS autocast
+    # Disable GradScaler for MPS due to float64 bugs in some torch versions
+    scaler = None
+else:
     scaler = GradScaler(device_type) if use_amp else None
 
     # Training loop
@@ -602,11 +603,16 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
                 with autocast(device_type):
                     _, loss = model(x, y, use_checkpoint=use_checkpoint)
                 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
             else:
                 _, loss = model(x, y, use_checkpoint=use_checkpoint)
                 loss.backward()
