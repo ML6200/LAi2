@@ -13,6 +13,7 @@ import json
 import struct
 import argparse
 import psutil
+import multiprocessing
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from pathlib import Path
@@ -23,6 +24,10 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast, GradScaler
 from torch.utils.checkpoint import checkpoint
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 @dataclass
@@ -228,40 +233,54 @@ class Transformer(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+def tokenize_worker(args):
+    text, tokenizer_path, max_len = args
+    # Re-load tokenizer in each worker because it's not easily picklable if it has large state
+    # but since it's small we can just pass it or load it once
+    tokenizer = BPETokenizer()
+    tokenizer.load(tokenizer_path)
+    tokens = tokenizer.encode(text)
+    
+    results = []
+    if len(tokens) <= max_len:
+        if len(tokens) > 2:
+            results.append(tokens)
+    else:
+        for i in range(0, len(tokens) - 1, max_len):
+            chunk = tokens[i:i + max_len + 1]
+            if len(chunk) > 2:
+                results.append(chunk)
+    return results
+
 class TextDataset(Dataset):
-    """Simple text dataset for training (Memory Optimized)"""
-    def __init__(self, texts: List[str], tokenizer, max_len: int = 512):
-        # Optimize memory: Store one big tensor and slices
-        all_tokens = []
-        self.slices = [] # (start_idx, length)
+    """Simple text dataset for training (Parallel Optimized)"""
+    def __init__(self, texts: List[str], tokenizer_path: str, max_len: int = 512):
+        print(f"  Tokenizing {len(texts)} lines using {multiprocessing.cpu_count()} cores...")
         
+        # Parallel tokenization
+        num_cores = multiprocessing.cpu_count()
+        with multiprocessing.Pool(num_cores) as pool:
+            # Map tokenize_worker across texts
+            worker_args = [(text, tokenizer_path, max_len) for text in texts]
+            
+            if tqdm:
+                results = list(tqdm(pool.imap(tokenize_worker, worker_args), total=len(texts), desc="  Tokenizing"))
+            else:
+                results = pool.map(tokenize_worker, worker_args)
+
+        # Flatten results and track slices
+        all_tokens = []
+        self.slices = []
         current_offset = 0
         
-        for text in texts:
-            tokens = tokenizer.encode(text)
-            
-            # Handle short texts
-            if len(tokens) <= max_len:
-                if len(tokens) > 2:  # Need at least x and y
-                    all_tokens.extend(tokens)
-                    self.slices.append((current_offset, len(tokens)))
-                    current_offset += len(tokens)
-                continue
-                
-            # Split longer texts into chunks
-            # stride = max_len // 2
-            stride = max_len
-            for i in range(0, len(tokens) - 1, stride):
-                chunk = tokens[i:i + max_len + 1]
-                if len(chunk) > 2:
-                    all_tokens.extend(chunk)
-                    self.slices.append((current_offset, len(chunk)))
-                    current_offset += len(chunk)
-        
-        # Convert to tensor to save memory (int64)
-        # using int32 or int16 could save more if vocab < 32k/65k, but keeping int64 (long) for safety/compatibility
+        for text_chunks in results:
+            for chunk in text_chunks:
+                all_tokens.extend(chunk)
+                self.slices.append((current_offset, len(chunk)))
+                current_offset += len(chunk)
+
         self.data = torch.tensor(all_tokens, dtype=torch.long)
-        print(f"  Dataset: {len(self.slices)} samples, {len(self.data)} tokens loaded into memory.")
+        print(f"  Dataset: {len(self.slices)} samples, {len(self.data)} tokens loaded.")
 
     def __len__(self):
         return len(self.slices)
@@ -495,7 +514,7 @@ def export_model(model: Transformer, tokenizer: BPETokenizer, path: str):
 
 def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
           epochs: int, batch_size: int, lr: float, device: str,
-          output_path: str):
+          output_path: str, vocab_path: str):
     """Train the model"""
     # CPU Optimization for Xeon
     if device == "cpu":
@@ -526,7 +545,7 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     print(f"  Parameters: {model.num_params() / 1e6:.1f}M")
 
     # Dataset and dataloader
-    dataset = TextDataset(train_texts, tokenizer, config.max_seq_len)
+    dataset = TextDataset(train_texts, vocab_path, config.max_seq_len)
 
     # Use more workers for Xeon CPU
     if device == "cpu":
@@ -666,7 +685,7 @@ def main():
         ] * 1000  # Repeat for more training data
 
     # Train
-    model = train(config, texts, tokenizer, args.epochs, args.batch_size, args.lr, args.device, args.output)
+    model = train(config, texts, tokenizer, args.epochs, args.batch_size, args.lr, args.device, args.output, args.vocab)
 
     # Export (vocabulary is embedded in model file now)
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
