@@ -55,7 +55,8 @@ class BPEVocabBuilder:
             self.vocab = checkpoint['vocab']
             self.scores = checkpoint['scores']
             words = checkpoint['words']
-            stats = checkpoint['stats']
+            # Ensure stats is a defaultdict
+            stats = defaultdict(int, checkpoint['stats'])
             word_freqs = checkpoint['word_freqs']
             start_iteration = checkpoint['iteration']
             print(f"  Resuming from iteration {start_iteration} (vocab_size={len(self.vocab)})")
