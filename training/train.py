@@ -542,6 +542,8 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
           epochs: int, batch_size: int, lr: float, device: str,
           output_path: str, vocab_path: str, grad_accum_steps: int = 1):
     """Train the model"""
+    ipex = None  # Intel Extension for PyTorch (set below if available)
+
     # CPU Optimization for Xeon and similar multi-core CPUs
     if device == "cpu":
         num_threads = psutil.cpu_count(logical=False)
@@ -553,9 +555,8 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
         try:
             import intel_extension_for_pytorch as ipex
             print(f"  IPEX available: {ipex.__version__}")
-        except ImportError:
+        except Exception:
             ipex = None
-            print("  Tip: Install intel-extension-for-pytorch for 1.5-2x Xeon speedup")
 
     checkpoint_dir = Path("checkpoints")
     checkpoint_dir.mkdir(exist_ok=True)
@@ -614,12 +615,11 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
                                  weight_decay=0.1, fused=use_fused)
 
     # IPEX optimization for Intel CPUs (wraps model + optimizer for Xeon speedup)
-    if device == "cpu":
+    if device == "cpu" and ipex is not None:
         try:
-            import intel_extension_for_pytorch as ipex
             model, optimizer = ipex.optimize(model, optimizer=optimizer, dtype=torch.bfloat16)
             print("  IPEX optimize applied (BF16)")
-        except (ImportError, Exception):
+        except Exception:
             pass
 
     # Learning rate scheduler
