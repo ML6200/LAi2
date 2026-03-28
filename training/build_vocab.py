@@ -91,8 +91,15 @@ class BPEVocabBuilder:
 
         # Create inverse index: pair -> set of word_strings that contain it
         print("  Building inverse index...")
+        try:
+            from tqdm import tqdm
+            pbar = tqdm(words.items(), desc="  Indexing")
+        except ImportError:
+            pbar = words.items()
+            print("  (tqdm not found, progress bar disabled)")
+
         pair_to_words = defaultdict(set)
-        for word_str, symbols in words.items():
+        for word_str, symbols in pbar:
             for i in range(len(symbols) - 1):
                 pair = (symbols[i], symbols[i+1])
                 pair_to_words[pair].add(word_str)
@@ -173,16 +180,13 @@ class BPEVocabBuilder:
                 # Cleanup zero or negative stats
                 stats = defaultdict(int, {k: v for k, v in stats.items() if v > 0})
                 
-                # Rebuild inverse index to remove dead references and keep it small
-                new_pair_to_words = defaultdict(set)
-                for pair, count in stats.items():
-                    # Only keep pairs that still exist in words
-                    for word_str in pair_to_words[pair]:
-                        # Quick check if pair still in symbols of this word
-                        if any(pair[0] == words[word_str][i] and pair[1] == words[word_str][i+1] 
-                               for i in range(len(words[word_str])-1)):
-                            new_pair_to_words[pair].add(word_str)
-                pair_to_words = new_pair_to_words
+                # Fast rebuild of inverse index to remove dead references and keep it small
+                pair_to_words = defaultdict(set)
+                for word_str, symbols in words.items():
+                    for i in range(len(symbols) - 1):
+                        pair = (symbols[i], symbols[i+1])
+                        if pair in stats:
+                            pair_to_words[pair].add(word_str)
 
                 print(f"  Iteration {iteration}: vocab_size={len(self.vocab)}, "
                       f"best_pair={repr(new_token[:20])}, freq={best_freq}")
