@@ -146,6 +146,7 @@ public:
 
         std::vector<i32> generated;
         std::string output;
+        size_t streamed_len = 0;  // Track how much of output has been streamed
         i32 pos = static_cast<i32>(tokens.size());
 
         // Track recent tokens for repetition penalty
@@ -166,30 +167,44 @@ public:
             }
             if (is_chat_stop) break;
 
-            // Decode and output token
+            // Decode token
             std::string token_str = tokenizer_.decode_token(next_token);
-
-            if (callback) {
-                if (!callback(token_str, next_token)) {
-                    break;  // User requested stop
-                }
-            }
-
             output += token_str;
             generated.push_back(next_token);
 
-            // Check for stop strings in accumulated output (handles multi-token sequences)
+            // Check if any stop string appears in output — truncate at first occurrence
             bool found_stop_str = false;
             for (const auto& ss : stop_strings_) {
-                if (output.size() >= ss.size() &&
-                    output.compare(output.size() - ss.size(), ss.size(), ss) == 0) {
-                    // Remove the stop string from output
-                    output.erase(output.size() - ss.size());
+                size_t pos_found = output.find(ss);
+                if (pos_found != std::string::npos) {
+                    output.erase(pos_found);
                     found_stop_str = true;
                     break;
                 }
             }
-            if (found_stop_str) break;
+            if (found_stop_str) {
+                // Flush any clean output that wasn't streamed yet
+                if (callback && streamed_len < output.size()) {
+                    callback(output.substr(streamed_len), next_token);
+                }
+                break;
+            }
+
+            // Stream tokens that can't be part of a stop string
+            if (callback) {
+                // Hold back enough chars to detect the longest stop string
+                size_t max_stop_len = 0;
+                for (const auto& ss : stop_strings_) {
+                    if (ss.size() > max_stop_len) max_stop_len = ss.size();
+                }
+                if (output.size() > max_stop_len + streamed_len) {
+                    size_t safe = output.size() - max_stop_len;
+                    if (safe > streamed_len) {
+                        if (!callback(output.substr(streamed_len, safe - streamed_len), next_token)) break;
+                        streamed_len = safe;
+                    }
+                }
+            }
 
             // Update recent tokens
             recent_tokens.push_back(next_token);
