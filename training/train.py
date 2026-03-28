@@ -594,11 +594,12 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     # Dataset and dataloader
     dataset = TextDataset(train_texts, vocab_path, config.max_seq_len)
 
-    # Use more workers for Xeon CPU or MPS
-    if device in ["cpu", "mps"]:
-        num_workers = min(psutil.cpu_count(logical=False), 8)
+    # DataLoader workers: only useful when I/O is the bottleneck.
+    # With cached in-memory dataset, workers add fork/IPC overhead.
+    if device == "cuda":
+        num_workers = 2  # GPU: overlap data transfer with compute
     else:
-        num_workers = 2
+        num_workers = 0  # CPU/MPS: dataset is in memory, workers just add overhead
         
     pin_memory = device == 'cuda'
 
