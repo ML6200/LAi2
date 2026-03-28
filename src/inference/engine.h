@@ -73,6 +73,15 @@ public:
         logits_ = Tensor(Shape(model_.config().vocab_size));
         sampler_ = Sampler();
 
+        // Register chat special tokens as stop token IDs
+        const char* stop_strs[] = {"<user>", "<system>", "</user>", "</system>", "</assistant>"};
+        for (const char* s : stop_strs) {
+            i32 id = tokenizer_.get_id(s);
+            if (id != SpecialTokens::UNK) {
+                stop_token_ids_.push_back(id);
+            }
+        }
+
         // Create compute backend
         if (backend_name == "cpu") {
             backend_.reset(Backend::create_cpu());
@@ -143,10 +152,15 @@ public:
             // Sample next token
             i32 next_token = sampler_.sample(logits_, gen_config, recent_tokens);
 
-            // Check for stop tokens
+            // Check for stop tokens (EOS, user-configured, and chat special tokens)
             if (next_token == SpecialTokens::EOS || gen_config.is_stop_token(next_token)) {
                 break;
             }
+            bool is_chat_stop = false;
+            for (i32 sid : stop_token_ids_) {
+                if (next_token == sid) { is_chat_stop = true; break; }
+            }
+            if (is_chat_stop) break;
 
             // Decode and output token
             std::string token_str = tokenizer_.decode_token(next_token);
@@ -293,6 +307,7 @@ private:
     Sampler sampler_;
     Tensor logits_;
     std::unique_ptr<Backend> backend_;
+    std::vector<i32> stop_token_ids_;
 };
 
 } // namespace lai

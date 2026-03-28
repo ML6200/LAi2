@@ -40,6 +40,11 @@ public:
             probs[i] = logits_data[i];
         }
 
+        // Mask special tokens so they are never sampled
+        // PAD=0, UNK=3 (from SpecialTokens in bpe.h)
+        probs[0] = -1e10f;  // PAD
+        probs[3] = -1e10f;  // UNK
+
         // Apply logit bias if provided
         if (logit_bias) {
             for (i64 i = 0; i < vocab_size; ++i) {

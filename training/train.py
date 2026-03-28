@@ -316,15 +316,9 @@ class TextDataset(Dataset):
 
 
 def collate_fn(batch):
-    """Pad batch to same length"""
-    max_len = max(len(x) for x, y in batch)
-    xs = torch.full((len(batch), max_len), 0, dtype=torch.long)
-    ys = torch.full((len(batch), max_len), -100, dtype=torch.long)
-
-    for i, (x, y) in enumerate(batch):
-        xs[i, :len(x)] = x
-        ys[i, :len(y)] = y
-
+    """Stack fixed-size blocks (all samples are pre-padded to same length)"""
+    xs = torch.stack([x for x, y in batch])
+    ys = torch.stack([y for x, y in batch])
     return xs, ys
 
 
@@ -493,8 +487,13 @@ def export_model(model: Transformer, tokenizer: BPETokenizer, path: str):
         f.write(struct.pack('I', 1))            # Version
         f.write(struct.pack('I', len(tokenizer.vocab)))  # Vocab size
 
-        for token, score in zip(tokenizer.vocab, tokenizer.scores):
-            token_bytes = token.encode('utf-8')
+        for i, (token, score) in enumerate(zip(tokenizer.vocab, tokenizer.scores)):
+            # Byte tokens (indices 4-259) must be saved as raw single bytes,
+            # not UTF-8 encoded (chr(0xC3).encode('utf-8') = 2 bytes, not 1)
+            if 4 <= i < 260:
+                token_bytes = bytes([i - 4])
+            else:
+                token_bytes = token.encode('utf-8')
             f.write(struct.pack('I', len(token_bytes)))
             f.write(token_bytes)
             f.write(struct.pack('f', score))
@@ -536,14 +535,22 @@ def export_model(model: Transformer, tokenizer: BPETokenizer, path: str):
 
 def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
           epochs: int, batch_size: int, lr: float, device: str,
-          output_path: str, vocab_path: str):
+          output_path: str, vocab_path: str, grad_accum_steps: int = 1):
     """Train the model"""
-    # CPU Optimization for Xeon
+    # CPU Optimization for Xeon and similar multi-core CPUs
     if device == "cpu":
         num_threads = psutil.cpu_count(logical=False)
         torch.set_num_threads(num_threads)
         torch.set_num_interop_threads(1) # Usually best for single-node CPU training
         print(f"  CPU Training: Using {num_threads} threads")
+
+        # Intel Extension for PyTorch (IPEX) — 1.5-2x speedup on Xeon
+        try:
+            import intel_extension_for_pytorch as ipex
+            print(f"  IPEX available: {ipex.__version__}")
+        except ImportError:
+            ipex = None
+            print("  Tip: Install intel-extension-for-pytorch for 1.5-2x Xeon speedup")
 
     checkpoint_dir = Path("checkpoints")
     checkpoint_dir.mkdir(exist_ok=True)
@@ -566,6 +573,20 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     model = Transformer(config).to(device)
     print(f"  Parameters: {model.num_params() / 1e6:.1f}M")
 
+    # torch.compile for PyTorch 2.0+ (works on CPU, CUDA, and MPS)
+    if hasattr(torch, 'compile'):
+        try:
+            if device == 'cuda':
+                compile_backend = 'inductor'
+            elif device == 'cpu':
+                compile_backend = 'inductor'  # inductor generates optimized C++ kernels for CPU
+            else:
+                compile_backend = 'aot_eager'
+            model = torch.compile(model, backend=compile_backend)
+            print(f"  torch.compile enabled (backend={compile_backend})")
+        except Exception as e:
+            print(f"  torch.compile unavailable: {e}")
+
     # Dataset and dataloader
     dataset = TextDataset(train_texts, vocab_path, config.max_seq_len)
 
@@ -586,8 +607,17 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     # Optimizer
     # Fused AdamW is significantly faster on most hardware
     use_fused = device == "cuda" or (device == "mps" and torch.backends.mps.is_available())
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95), 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95),
                                  weight_decay=0.1, fused=use_fused)
+
+    # IPEX optimization for Intel CPUs (wraps model + optimizer for Xeon speedup)
+    if device == "cpu":
+        try:
+            import intel_extension_for_pytorch as ipex
+            model, optimizer = ipex.optimize(model, optimizer=optimizer, dtype=torch.bfloat16)
+            print("  IPEX optimize applied (BF16)")
+        except (ImportError, Exception):
+            pass
 
     # Learning rate scheduler
     warmup_steps = 100
@@ -598,63 +628,74 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
         progress = (step - warmup_steps) / (total_steps - warmup_steps)
         return 0.1 + 0.9 * (1 + math.cos(math.pi * progress)) / 2
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    # Mixed precision
-    use_amp = device != 'cpu'
+    # Mixed precision (also enable BF16 autocast on CPU for Xeon with AVX2+)
+    use_amp = True
     device_type = 'cuda' if 'cuda' in device else ('cpu' if 'cpu' in device else 'mps')
     
-    # Handle MPS (Apple Silicon)
-    if device == 'mps':
-        use_amp = True # Newer PyTorch supports MPS autocast
-        # Disable GradScaler for MPS due to float64 bugs in some torch versions
-        scaler = None
-    else:
+    # GradScaler only works with CUDA (not MPS or CPU)
+    if device == 'cuda':
         scaler = GradScaler(device_type) if use_amp else None
+    else:
+        scaler = None
 
     # Training loop
     model.train()
     global_step = 0
-    process = psutil.Process()
-    
+
     # Only use checkpointing for large models or if explicitly enabled
     use_checkpoint = config.n_layers >= 16
+
+    effective_batch = batch_size * grad_accum_steps
+    if grad_accum_steps > 1:
+        print(f"  Gradient accumulation: {grad_accum_steps} steps (effective batch={effective_batch})")
 
     for epoch in range(epochs):
         total_loss = 0
         for batch_idx, (x, y) in enumerate(dataloader):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-            optimizer.zero_grad()
+            is_accum_step = (batch_idx + 1) % grad_accum_steps != 0
 
             if use_amp:
                 with autocast(device_type):
                     _, loss = model(x, y, use_checkpoint=use_checkpoint)
-                
+                    if grad_accum_steps > 1:
+                        loss = loss / grad_accum_steps
+
                 if scaler:
                     scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    if not is_accum_step:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
                 else:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                    if not is_accum_step:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        scheduler.step()
             else:
                 _, loss = model(x, y, use_checkpoint=use_checkpoint)
+                if grad_accum_steps > 1:
+                    loss = loss / grad_accum_steps
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                
-            scheduler.step()
+                if not is_accum_step:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    scheduler.step()
 
-            total_loss += loss.item()
+            total_loss += loss.item() * (grad_accum_steps if grad_accum_steps > 1 else 1)
             global_step += 1
 
             if batch_idx % 100 == 0:
-                mem_rss = process.memory_info().rss / 1024 / 1024
                 print(f"  Epoch {epoch+1}/{epochs}, Step {batch_idx}/{len(dataloader)}, "
-                      f"Loss: {loss.item():.4f}, LR: {scheduler.get_last_lr()[0]:.2e}, "
-                      f"RSS: {mem_rss:.0f}MB")
+                      f"Loss: {loss.item() * (grad_accum_steps if grad_accum_steps > 1 else 1):.4f}, "
+                      f"LR: {scheduler.get_last_lr()[0]:.2e}")
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch+1} complete. Average loss: {avg_loss:.4f}")
@@ -677,6 +718,7 @@ def main():
                        help="Path to vocabulary file (must exist)")
     parser.add_argument("--output", type=str, default="models/lai-mini.bin")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--grad_accum", type=int, default=1, help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
     args = parser.parse_args()
 
     # Get config
@@ -719,7 +761,7 @@ def main():
         ] * 1000  # Repeat for more training data
 
     # Train
-    model = train(config, texts, tokenizer, args.epochs, args.batch_size, args.lr, args.device, args.output, args.vocab)
+    model = train(config, texts, tokenizer, args.epochs, args.batch_size, args.lr, args.device, args.output, args.vocab, args.grad_accum)
 
     # Export (vocabulary is embedded in model file now)
     os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)

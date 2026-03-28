@@ -218,8 +218,13 @@ class BPEVocabBuilder:
             f.write(struct.pack('I', len(self.vocab)))  # Vocab size
 
             # Tokens
-            for token, score in zip(self.vocab, self.scores):
-                token_bytes = token.encode('utf-8')
+            for i, (token, score) in enumerate(zip(self.vocab, self.scores)):
+                # Byte tokens (indices 4-259) must be saved as raw single bytes,
+                # not UTF-8 encoded (chr(0xC3).encode('utf-8') = 2 bytes, not 1)
+                if 4 <= i < 260:
+                    token_bytes = bytes([i - 4])
+                else:
+                    token_bytes = token.encode('utf-8')
                 f.write(struct.pack('I', len(token_bytes)))
                 f.write(token_bytes)
                 f.write(struct.pack('f', score))
