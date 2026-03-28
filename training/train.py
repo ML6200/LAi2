@@ -199,7 +199,7 @@ class Transformer(nn.Module):
             precompute_freqs_cis(config.dim // config.n_heads, config.max_seq_len, config.rope_theta)
         )
 
-    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None):
+    def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None, use_checkpoint: bool = False):
         bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
 
@@ -209,8 +209,8 @@ class Transformer(nn.Module):
         freqs_cis = self.freqs_cis[:seqlen]
 
         for layer in self.layers:
-            # Gradient checkpointing
-            if self.training:
+            # Gradient checkpointing only if requested and training
+            if self.training and use_checkpoint:
                 h = checkpoint(layer, h, freqs_cis, mask, use_reentrant=False)
             else:
                 h = layer(h, freqs_cis, mask)
@@ -547,11 +547,11 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     # Dataset and dataloader
     dataset = TextDataset(train_texts, vocab_path, config.max_seq_len)
 
-    # Use more workers for Xeon CPU
-    if device == "cpu":
+    # Use more workers for Xeon CPU or MPS
+    if device in ["cpu", "mps"]:
         num_workers = min(psutil.cpu_count(logical=False), 8)
     else:
-        num_workers = 0 if device == 'mps' else 2
+        num_workers = 2
         
     pin_memory = device == 'cuda'
 
@@ -575,12 +575,11 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
 
     # Mixed precision
     use_amp = device != 'cpu'
-    device_type = 'cuda' if 'cuda' in device else ('cpu' if 'cpu' in device else 'cuda')
+    device_type = 'cuda' if 'cuda' in device else ('cpu' if 'cpu' in device else 'mps')
     
     # Handle MPS (Apple Silicon)
     if device == 'mps':
-        device_type = 'mps'
-        use_amp = False # MPS autocast support varies, safer to disable for this simple script
+        use_amp = True # Newer PyTorch supports MPS autocast
         
     scaler = GradScaler(device_type) if use_amp else None
 
@@ -588,6 +587,9 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
     model.train()
     global_step = 0
     process = psutil.Process()
+    
+    # Only use checkpointing for large models or if explicitly enabled
+    use_checkpoint = config.n_layers >= 16
 
     for epoch in range(epochs):
         total_loss = 0
@@ -598,7 +600,7 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
 
             if use_amp:
                 with autocast(device_type):
-                    _, loss = model(x, y)
+                    _, loss = model(x, y, use_checkpoint=use_checkpoint)
                 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -606,7 +608,7 @@ def train(config: ModelConfig, train_texts: List[str], tokenizer: BPETokenizer,
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                _, loss = model(x, y)
+                _, loss = model(x, y, use_checkpoint=use_checkpoint)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
