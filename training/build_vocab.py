@@ -144,12 +144,14 @@ class BPEVocabBuilder:
                         if i > 0:
                             old_pair = (symbols[i-1], symbols[i])
                             stats[old_pair] -= freq
-                            # We don't remove from pair_to_words immediately to avoid slow set operations
+                            if word_str in pair_to_words[old_pair]:
+                                pair_to_words[old_pair].remove(word_str)
                         if i < len(symbols) - 2:
-                            # Avoid double counting if the next pair is also the best_pair
                             if not (symbols[i+1] == best_pair[0] and symbols[i+2] == best_pair[1]):
                                 old_pair = (symbols[i+1], symbols[i+2])
                                 stats[old_pair] -= freq
+                                if word_str in pair_to_words[old_pair]:
+                                    pair_to_words[old_pair].remove(word_str)
                         
                         # Merge
                         new_symbols.append(new_token)
@@ -173,24 +175,25 @@ class BPEVocabBuilder:
             
             # Cleanup the merged pair
             del stats[best_pair]
-            del pair_to_words[best_pair]
+            if best_pair in pair_to_words:
+                del pair_to_words[best_pair]
 
-            # Periodic cleanup and recount to fix drift and maintain speed
-            if iteration % 200 == 0:
-                # Cleanup zero or negative stats
-                stats = defaultdict(int, {k: v for k, v in stats.items() if v > 0})
-                
-                # Fast rebuild of inverse index to remove dead references and keep it small
-                pair_to_words = defaultdict(set)
-                for word_str, symbols in words.items():
-                    for i in range(len(symbols) - 1):
-                        pair = (symbols[i], symbols[i+1])
-                        if pair in stats:
-                            pair_to_words[pair].add(word_str)
-
+            # Periodic cleanup and status update
+            if iteration % 10 == 0:
                 print(f"  Iteration {iteration}: vocab_size={len(self.vocab)}, "
                       f"best_pair={repr(new_token[:20])}, freq={best_freq}")
                 
+                if iteration % 200 == 0:
+                    # Cleanup zero or negative stats
+                    stats = defaultdict(int, {k: v for k, v in stats.items() if v > 0})
+                    
+                    # Fast rebuild of inverse index to keep it lean
+                    pair_to_words = defaultdict(set)
+                    for word_str, syms in words.items():
+                        for i in range(len(syms) - 1):
+                            p = (syms[i], syms[i+1])
+                            pair_to_words[p].add(word_str)
+
                 if iteration % 1000 == 0 and iteration > start_iteration:
                     self.save_checkpoint(words, stats, word_freqs, iteration)
 
