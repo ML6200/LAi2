@@ -73,13 +73,17 @@ public:
         logits_ = Tensor(Shape(model_.config().vocab_size));
         sampler_ = Sampler();
 
-        // Register chat special tokens as stop token IDs
-        const char* stop_strs[] = {"<user>", "<system>", "</user>", "</system>", "</assistant>"};
-        for (const char* s : stop_strs) {
+        // Register chat special tokens as stop token IDs (if they exist as single tokens)
+        const char* special_strs[] = {"<user>", "<system>", "</user>", "</system>", "</assistant>"};
+        for (const char* s : special_strs) {
             i32 id = tokenizer_.get_id(s);
             if (id != SpecialTokens::UNK) {
                 stop_token_ids_.push_back(id);
             }
+        }
+        // Also register as stop strings (for when they span multiple tokens)
+        for (const char* s : special_strs) {
+            stop_strings_.push_back(s);
         }
 
         // Create compute backend
@@ -173,6 +177,19 @@ public:
 
             output += token_str;
             generated.push_back(next_token);
+
+            // Check for stop strings in accumulated output (handles multi-token sequences)
+            bool found_stop_str = false;
+            for (const auto& ss : stop_strings_) {
+                if (output.size() >= ss.size() &&
+                    output.compare(output.size() - ss.size(), ss.size(), ss) == 0) {
+                    // Remove the stop string from output
+                    output.erase(output.size() - ss.size());
+                    found_stop_str = true;
+                    break;
+                }
+            }
+            if (found_stop_str) break;
 
             // Update recent tokens
             recent_tokens.push_back(next_token);
@@ -308,6 +325,7 @@ private:
     Tensor logits_;
     std::unique_ptr<Backend> backend_;
     std::vector<i32> stop_token_ids_;
+    std::vector<std::string> stop_strings_;
 };
 
 } // namespace lai
