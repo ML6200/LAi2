@@ -1,5 +1,11 @@
 # LAi - Lightweight AI Assistant
 
+# ⚠️ Warning
+
+**This repository is under active development and currently not functional.**
+
+---
+
 A from-scratch efficient LLM assistant written in pure C++ for CPU-only inference on low-end hardware created with Claude Code by experiment. Optimized for Hungarian and English. 
 
 ## Features
